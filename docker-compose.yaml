@@ -1,0 +1,75 @@
+# Behaviour-Profile microservice + its PostgreSQL profile store.
+#
+#   cp .env.example .env      # then fill in secrets
+#   docker compose up -d --build
+#   docker compose logs -f
+#
+# Service:  http://localhost:8080   (docs /docs, demo /demo, sync /sync)
+# Store:    PostgreSQL 17 on 127.0.0.1:5432 (loopback only — never published wide)
+#
+# The store lives in a NAMED VOLUME: it survives `docker compose down`.
+# It does NOT survive `docker compose down -v` — never use -v here.
+# A volume is not a backup: schedule pg_dump (see RUNBOOK).
+services:
+  db:
+    image: postgres:17
+    container_name: behaviour-profile-db
+    # Loopback only: the store is reachable from this host, not the whole network.
+    # STORE_PG_HOST_PORT is the port published on YOUR machine (default 5433 so it
+    # never clashes with a local postgres on 5432). Inside the compose network the
+    # service always talks to db:5432.
+    ports:
+      - "127.0.0.1:${STORE_PG_HOST_PORT:-5433}:5432"
+    environment:
+      POSTGRES_DB: ${STORE_PG_DB:-behaviour}
+      POSTGRES_USER: ${STORE_PG_USER:-behaviour}
+      POSTGRES_PASSWORD: ${STORE_PG_PASSWORD:?STORE_PG_PASSWORD must be set in .env}
+      PGDATA: /var/lib/postgresql/data/pgdata17
+    restart: unless-stopped
+    shm_size: 256mb                     # Postgres wants more than the 64mb default
+    volumes:
+      - pgdata17:/var/lib/postgresql/data/pgdata17
+      # Applied automatically on FIRST init of an empty volume:
+      - ./schema_pg.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging:                            # bounded logs; ship them off-host in prod
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  behaviour-profile:
+    build: .
+    image: adhere-behaviour:latest
+    container_name: adhere-behaviour
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env                            # all secrets + tuning come from here
+    environment:
+      STORE_PG_HOST: db                 # reach the store over the compose network
+      STORE_PG_PORT: 5432
+    depends_on:
+      db:
+        condition: service_healthy      # never start before the store is ready
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  pgdata17:                             # named volume — the profile store lives here
+    name: behaviour_pgdata17

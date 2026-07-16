@@ -1,0 +1,18 @@
+# Behaviour-profile pipeline + microservice.
+# NOTE: the batch extract scripts still shell out to the `psql` client
+#       (Debian/Ubuntu: apt-get install -y postgresql-client). It is NOT a pip package.
+fastapi==0.139.0
+uvicorn[standard]==0.51.0
+psycopg[binary]>=3.2,<4   # PostgreSQL driver (v3) — profile store AND production reads
+polars==1.42.0            # dataframe engine (also reads/writes Parquet natively)
+pyarrow>=17
+openpyxl>=3.1             # only for load_rules.py (reads AML_Rules.xlsx)
+python-dotenv>=1.0
+tqdm>=4.66                # progress bar for the batch sync CLI (not used in the service)
+
+# Legacy: only needed by migrate_mysql_to_pg.py to copy the old profiles across.
+# Remove once the migration is done and the MySQL store is retired.
+pymysql>=1.1,<2
+
+# Deliberately NOT here (see ingestionstratimprove.md §10): pandas (polars already
+# covers it), sqlalchemy (we use plain SQL), diskcache/joblib (the cache is Postgres).
