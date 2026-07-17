@@ -1,0 +1,17 @@
+{
+  "requests": 4275,
+  "http_failures": 0,
+  "rps": 72.3,
+  "latency_ms": {
+    "p50": 610,
+    "p95": 1000,
+    "p99": 1400,
+    "max": 2156.1215849997097,
+    "avg": 634.2
+  },
+  "sla_ms": 600.0,
+  "sla_breaches": 2217,
+  "sla_breach_pct": 51.86,
+  "sla_met_at_p95": false,
+  "finished_at": "2026-07-17T13:47:14.688013Z"
+}

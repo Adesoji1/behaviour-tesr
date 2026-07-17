@@ -35,3 +35,9 @@ venv/
 .vscode/
 .DS_Store
 migrate_dumps/
+
+# EXCEPTION: committed load-test EVIDENCE under docs/ is aggregate stats only (no PII),
+# so re-include it despite the global *.csv / *.log ignores above.
+!docs/loadtest/
+!docs/loadtest/*.csv
+!docs/loadtest/*.log

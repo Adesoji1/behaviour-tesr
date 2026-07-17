@@ -1,0 +1,54 @@
+[2026-07-17 13:25:38,823] aca48279994b/INFO/locust.main: Starting Locust 2.45.0
+[2026-07-17 13:25:38,826] aca48279994b/INFO/locust.main: Run time limit set to 60 seconds
+[2026-07-17 13:25:38,830] aca48279994b/INFO/locust.runners: Ramping to 50 users at a rate of 10.00 per second
+[2026-07-17 13:25:42,859] aca48279994b/INFO/locust.runners: All users spawned: {"ScoreUser": 50} (50 total users)
+[2026-07-17 13:26:37,793] aca48279994b/INFO/locust.main: --run-time limit reached, shutting down
+[2026-07-17 13:26:38,406] aca48279994b/INFO/locust.main: Shutting down (exit code 0)
+[2026-07-17 13:32:47,833] a447dc078464/INFO/locust.main: Starting Locust 2.45.0
+[2026-07-17 13:32:47,835] a447dc078464/INFO/locust.main: Run time limit set to 60 seconds
+[2026-07-17 13:32:47,839] a447dc078464/INFO/locust.runners: Ramping to 50 users at a rate of 10.00 per second
+[2026-07-17 13:32:51,860] a447dc078464/INFO/locust.runners: All users spawned: {"ScoreUser": 50} (50 total users)
+[2026-07-17 13:33:46,883] a447dc078464/INFO/locust.main: --run-time limit reached, shutting down
+[2026-07-17 13:33:47,374] a447dc078464/INFO/locust.main: Shutting down (exit code 1)
+[2026-07-17 13:39:15,970] d27c6a28f237/INFO/locust.main: Starting Locust 2.45.0
+[2026-07-17 13:39:15,973] d27c6a28f237/INFO/locust.main: Run time limit set to 60 seconds
+[2026-07-17 13:39:15,978] d27c6a28f237/INFO/locust.runners: Ramping to 50 users at a rate of 10.00 per second
+[2026-07-17 13:39:20,007] d27c6a28f237/INFO/locust.runners: All users spawned: {"ScoreUser": 50} (50 total users)
+[2026-07-17 13:40:14,955] d27c6a28f237/INFO/locust.main: --run-time limit reached, shutting down
+[2026-07-17 13:40:15,578] d27c6a28f237/INFO/locust.main: Shutting down (exit code 0)
+[2026-07-17 13:41:02,066] c98728fdcced/INFO/locust.main: Starting Locust 2.45.0
+[2026-07-17 13:41:02,068] c98728fdcced/INFO/locust.main: Run time limit set to 30 seconds
+[2026-07-17 13:41:02,072] c98728fdcced/INFO/locust.runners: Ramping to 10 users at a rate of 10.00 per second
+[2026-07-17 13:41:02,077] c98728fdcced/INFO/locust.runners: All users spawned: {"ScoreUser": 10} (10 total users)
+[2026-07-17 13:41:31,197] c98728fdcced/INFO/locust.main: --run-time limit reached, shutting down
+[2026-07-17 13:41:31,668] c98728fdcced/INFO/locust.main: Shutting down (exit code 0)
+[2026-07-17 13:41:37,288] 7b37b66338b3/INFO/locust.main: Starting Locust 2.45.0
+[2026-07-17 13:41:37,291] 7b37b66338b3/INFO/locust.main: Run time limit set to 30 seconds
+[2026-07-17 13:41:37,295] 7b37b66338b3/INFO/locust.runners: Ramping to 25 users at a rate of 10.00 per second
+[2026-07-17 13:41:39,307] 7b37b66338b3/INFO/locust.runners: All users spawned: {"ScoreUser": 25} (25 total users)
+[2026-07-17 13:42:06,259] 7b37b66338b3/INFO/locust.main: --run-time limit reached, shutting down
+[2026-07-17 13:42:06,844] 7b37b66338b3/INFO/locust.main: Shutting down (exit code 0)
+[2026-07-17 13:43:03,157] 14eeee154cbe/INFO/locust.main: Starting Locust 2.45.0
+[2026-07-17 13:43:03,159] 14eeee154cbe/INFO/locust.main: Run time limit set to 30 seconds
+[2026-07-17 13:43:03,163] 14eeee154cbe/INFO/locust.runners: Ramping to 5 users at a rate of 10.00 per second
+[2026-07-17 13:43:03,168] 14eeee154cbe/INFO/locust.runners: All users spawned: {"ScoreUser": 5} (5 total users)
+[2026-07-17 13:43:32,283] 14eeee154cbe/INFO/locust.main: --run-time limit reached, shutting down
+[2026-07-17 13:43:32,728] 14eeee154cbe/INFO/locust.main: Shutting down (exit code 0)
+[2026-07-17 13:43:37,344] 2c4c3ef4bd5f/INFO/locust.main: Starting Locust 2.45.0
+[2026-07-17 13:43:37,346] 2c4c3ef4bd5f/INFO/locust.main: Run time limit set to 30 seconds
+[2026-07-17 13:43:37,350] 2c4c3ef4bd5f/INFO/locust.runners: Ramping to 10 users at a rate of 10.00 per second
+[2026-07-17 13:43:37,358] 2c4c3ef4bd5f/INFO/locust.runners: All users spawned: {"ScoreUser": 10} (10 total users)
+[2026-07-17 13:44:06,441] 2c4c3ef4bd5f/INFO/locust.main: --run-time limit reached, shutting down
+[2026-07-17 13:44:06,907] 2c4c3ef4bd5f/INFO/locust.main: Shutting down (exit code 0)
+[2026-07-17 13:44:11,556] 2e2217703010/INFO/locust.main: Starting Locust 2.45.0
+[2026-07-17 13:44:11,558] 2e2217703010/INFO/locust.main: Run time limit set to 30 seconds
+[2026-07-17 13:44:11,562] 2e2217703010/INFO/locust.runners: Ramping to 20 users at a rate of 10.00 per second
+[2026-07-17 13:44:12,568] 2e2217703010/INFO/locust.runners: All users spawned: {"ScoreUser": 20} (20 total users)
+[2026-07-17 13:44:40,713] 2e2217703010/INFO/locust.main: --run-time limit reached, shutting down
+[2026-07-17 13:44:41,222] 2e2217703010/INFO/locust.main: Shutting down (exit code 0)
+[2026-07-17 13:46:15,487] 2ce64d11546a/INFO/locust.main: Starting Locust 2.45.0
+[2026-07-17 13:46:15,489] 2ce64d11546a/INFO/locust.main: Run time limit set to 60 seconds
+[2026-07-17 13:46:15,493] 2ce64d11546a/INFO/locust.runners: Ramping to 50 users at a rate of 10.00 per second
+[2026-07-17 13:46:19,520] 2ce64d11546a/INFO/locust.runners: All users spawned: {"ScoreUser": 50} (50 total users)
+[2026-07-17 13:47:14,461] 2ce64d11546a/INFO/locust.main: --run-time limit reached, shutting down
+[2026-07-17 13:47:15,062] 2ce64d11546a/INFO/locust.main: Shutting down (exit code 0)
