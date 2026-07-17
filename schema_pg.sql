@@ -48,6 +48,7 @@ $$ LANGUAGE plpgsql;
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS bp_user_behaviour_profile (
     entity_key              VARCHAR(128) NOT NULL,
+    currency                VARCHAR(8)   NOT NULL DEFAULT 'NGN',  -- per-currency grain
     branch_id               BIGINT       NULL,
     origin_account_no       VARCHAR(64)  NULL,
     customer_id             BIGINT       NULL,
@@ -147,8 +148,10 @@ CREATE TABLE IF NOT EXISTS bp_user_behaviour_profile (
     created_at              TIMESTAMP NOT NULL DEFAULT now(),
     updated_at              TIMESTAMP NOT NULL DEFAULT now(),
 
-    PRIMARY KEY (entity_key)
+    PRIMARY KEY (entity_key, currency)          -- one row per customer PER CURRENCY
 );
+-- "all of a customer's currencies" reads (endpoints) still hit an index on entity_key.
+CREATE INDEX IF NOT EXISTS idx_bp_profile_entity ON bp_user_behaviour_profile (entity_key);
 CREATE INDEX IF NOT EXISTS idx_bp_profile_customer ON bp_user_behaviour_profile (customer_id);
 CREATE INDEX IF NOT EXISTS idx_bp_profile_branch   ON bp_user_behaviour_profile (branch_id);
 CREATE INDEX IF NOT EXISTS idx_bp_profile_acct     ON bp_user_behaviour_profile (origin_account_no);
@@ -164,6 +167,7 @@ CREATE TRIGGER trg_bp_profile_updated BEFORE UPDATE ON bp_user_behaviour_profile
 CREATE TABLE IF NOT EXISTS bp_profile_history (
     id              BIGSERIAL PRIMARY KEY,
     entity_key      VARCHAR(128) NOT NULL,
+    currency        VARCHAR(8)   NULL,          -- which currency profile this snapshot is
     build_run_id    VARCHAR(64)  NOT NULL,
     snapshot_ts     TIMESTAMP    NOT NULL DEFAULT now(),
     profile_version INTEGER      NOT NULL,
@@ -247,6 +251,7 @@ CREATE TRIGGER trg_bp_rs_updated BEFORE UPDATE ON bp_rule_settings
 CREATE TABLE IF NOT EXISTS bp_peer_baseline (
     branch_id               BIGINT       NOT NULL,
     account_type            VARCHAR(32)  NOT NULL,
+    currency                VARCHAR(8)   NOT NULL DEFAULT 'NGN',  -- per-currency peers
     peer_entities           INTEGER      NULL,
     peer_tx_count           BIGINT       NULL,
     avg_amount              NUMERIC(30,4) NULL,
@@ -260,7 +265,7 @@ CREATE TABLE IF NOT EXISTS bp_peer_baseline (
     peak_transaction_hours  TEXT          NULL,
     build_run_id            VARCHAR(64)   NULL,
     updated_at              TIMESTAMP     NOT NULL DEFAULT now(),
-    PRIMARY KEY (branch_id, account_type)
+    PRIMARY KEY (branch_id, account_type, currency)
 );
 DROP TRIGGER IF EXISTS trg_bp_peer_updated ON bp_peer_baseline;
 CREATE TRIGGER trg_bp_peer_updated BEFORE UPDATE ON bp_peer_baseline
@@ -272,7 +277,7 @@ CREATE TRIGGER trg_bp_peer_updated BEFORE UPDATE ON bp_peer_baseline
 CREATE TABLE IF NOT EXISTS bp_rule_event (
     id             BIGSERIAL PRIMARY KEY,
     entity_key     VARCHAR(128) NULL,
-    transaction_id VARCHAR(64)  NULL,
+    transaction_id TEXT         NULL,
     rule_code      VARCHAR(64)  NOT NULL,
     fired_at       TIMESTAMP    NOT NULL DEFAULT now(),
     severity       VARCHAR(16)  NULL,
@@ -289,7 +294,7 @@ CREATE INDEX IF NOT EXISTS idx_bp_evt_rule   ON bp_rule_event (rule_code);
 CREATE TABLE IF NOT EXISTS bp_event_log (
     id             BIGSERIAL PRIMARY KEY,
     entity_key     VARCHAR(128) NULL,
-    transaction_id VARCHAR(64)  NULL,
+    transaction_id TEXT         NULL,
     event_type     VARCHAR(32)  NOT NULL,
     outcome        VARCHAR(32)  NULL,
     detail         TEXT         NULL,
@@ -327,7 +332,7 @@ CREATE TABLE IF NOT EXISTS bp_build_run (
 CREATE TABLE IF NOT EXISTS bp_transactions_cache (
     id                          BIGINT       NOT NULL PRIMARY KEY,  -- production row id
     entity_key                  VARCHAR(128) NOT NULL,              -- branch_id:origin_account_no
-    transaction_id              VARCHAR(64)  NULL,
+    transaction_id TEXT         NULL,
     amount                      NUMERIC(30,2) NULL,
     currency                    VARCHAR(8)   NULL,
     transaction_type            VARCHAR(64)  NULL,
@@ -379,3 +384,153 @@ CREATE TABLE IF NOT EXISTS bp_sync_state (
 DROP TRIGGER IF EXISTS trg_bp_sync_updated ON bp_sync_state;
 CREATE TRIGGER trg_bp_sync_updated BEFORE UPDATE ON bp_sync_state
     FOR EACH ROW EXECUTE FUNCTION bp_set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- 10. DECISION LOG — the behavioural analysis of every scored transaction
+-- ---------------------------------------------------------------------------
+-- The audit record Anita asked for: one row per POST /score. Stores the decision,
+-- the exact rules that fired (with severity + details), what the account was judged
+-- against, why it was/wasn't trusted, how long scoring took, and the webhook delivery
+-- outcome. This is the queryable behavioural-analysis trail for compliance — separate
+-- from the generic bp_event_log so a reviewer can go straight to "every decision".
+CREATE TABLE IF NOT EXISTS bp_decision (
+    id              BIGSERIAL    PRIMARY KEY,
+    entity_key      VARCHAR(128) NOT NULL,
+    transaction_id TEXT         NULL,
+    decision        VARCHAR(16)  NOT NULL,      -- allow | review
+    fired_rules     TEXT         NULL,          -- JSON: [{rule, severity, details}, ...]
+    rules_fired_n   INTEGER      NOT NULL DEFAULT 0,
+    judged_against  VARCHAR(32)  NULL,          -- own_profile | peer_group | peer_group(new)
+    trust_reason    TEXT         NULL,          -- why it was / was not judged on its own profile
+    own_profile_anomaly BOOLEAN  NOT NULL DEFAULT false,
+    amount          NUMERIC(30,2) NULL,
+    currency        VARCHAR(8)   NULL,
+    latency_ms      DOUBLE PRECISION NULL,      -- how long the decision took (speed audit)
+    -- Transactional OUTBOX for guaranteed webhook delivery. The decision AND its
+    -- webhook_status='pending' marker are written in the SAME commit, so a delivery is
+    -- never lost to an API crash. A relay (webhook_relay.py, in the sync service)
+    -- redelivers 'pending' rows with exponential backoff until they succeed or exhaust
+    -- the retry budget. Lifecycle:  pending -> sent | dead  (disabled = no webhook set).
+    webhook_status  VARCHAR(16)  NULL,          -- pending | sent | dead | disabled
+    webhook_detail  TEXT         NULL,          -- last attempt's reason / error
+    webhook_attempts INTEGER     NOT NULL DEFAULT 0,   -- delivery attempts made so far
+    webhook_next_attempt_at TIMESTAMP NULL,     -- when the relay may next try (NULL = terminal)
+    scored_at       TIMESTAMP    NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_bp_decision_entity ON bp_decision (entity_key, scored_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bp_decision_txn    ON bp_decision (transaction_id);
+CREATE INDEX IF NOT EXISTS idx_bp_decision_review ON bp_decision (decision, scored_at DESC);
+-- NOTE: the relay's partial index on webhook_next_attempt_at is created in the MIGRATIONS
+-- section below, AFTER the guarded ALTER that adds the column — so this whole script still
+-- applies cleanly (in one transaction) against a bp_decision created before those columns.
+
+-- ---------------------------------------------------------------------------
+-- 11. WEBHOOK DELIVERY LOG — every attempt to deliver a decision (append-only)
+-- ---------------------------------------------------------------------------
+-- Compliance/audit trail of outbound webhook deliveries. bp_decision holds the LATEST
+-- webhook status for a decision; this table records EVERY attempt (append-only) with
+-- the URL, HTTP status, response detail and latency — so an auditor can prove exactly
+-- when and how each decision was (or was not) delivered to the downstream system.
+CREATE TABLE IF NOT EXISTS bp_webhook_delivery (
+    id              BIGSERIAL    PRIMARY KEY,
+    decision_id     BIGINT       NULL,          -- FK-ish to bp_decision.id
+    entity_key      VARCHAR(128) NULL,
+    transaction_id TEXT         NULL,
+    url             TEXT         NULL,          -- where we posted (no secrets)
+    status          VARCHAR(16)  NOT NULL,      -- sent | failed | disabled
+    http_status     INTEGER      NULL,          -- 200, 500, ... (null on transport error)
+    detail          TEXT         NULL,          -- reason / error, truncated
+    signed          BOOLEAN      NOT NULL DEFAULT false,  -- was an HMAC signature sent?
+    latency_ms      DOUBLE PRECISION NULL,      -- how long the delivery attempt took
+    attempted_at    TIMESTAMP    NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_bp_wh_decision ON bp_webhook_delivery (decision_id);
+CREATE INDEX IF NOT EXISTS idx_bp_wh_txn      ON bp_webhook_delivery (transaction_id);
+CREATE INDEX IF NOT EXISTS idx_bp_wh_status   ON bp_webhook_delivery (status, attempted_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- 12. RECENT TRANSACTIONS — the real-time velocity/burst source.
+-- ---------------------------------------------------------------------------
+-- Every transaction POST /score sees is recorded here, so the velocity rules
+-- (1m/10m/15m/1h/24h bursts) are computed from what the SERVICE itself has just seen —
+-- real-time, ~ms, and with NO production read. Pruned to a short retention window (the
+-- longest velocity window is 24h). This is the local recent-window store that replaced
+-- the per-score production lookup.
+CREATE TABLE IF NOT EXISTS bp_recent_txn (
+    id                      BIGSERIAL    PRIMARY KEY,
+    entity_key              VARCHAR(128) NOT NULL,      -- branch_id:origin_account_no
+    ts                      TIMESTAMP    NOT NULL,      -- the transaction time (as scored)
+    amount                  NUMERIC(30,2) NULL,
+    destination_account_no  VARCHAR(128) NULL,          -- beneficiary (distinct-recipient windows)
+    origin_country          VARCHAR(16)  NULL,          -- distinct-countries-in-1h window
+    destination_country     VARCHAR(16)  NULL,
+    currency                VARCHAR(8)   NULL,
+    created_at              TIMESTAMP    NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_bp_recent_entity_ts ON bp_recent_txn (entity_key, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_bp_recent_ts        ON bp_recent_txn (ts);
+
+-- ---------------------------------------------------------------------------
+-- MIGRATIONS (idempotent, guarded) — applied by ensure_schema() on startup.
+-- CREATE ... IF NOT EXISTS never alters an existing table, so additive column
+-- changes go here. Each is a no-op once applied (checks the current type first,
+-- so a large table is never rewritten on every boot).
+-- ---------------------------------------------------------------------------
+-- Real production transaction_id values are up to 88 chars; widen from VARCHAR(64).
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['bp_transactions_cache','bp_rule_event','bp_event_log',
+                           'bp_decision','bp_webhook_delivery'] LOOP
+    IF to_regclass(t) IS NOT NULL AND EXISTS (
+         SELECT 1 FROM information_schema.columns
+          WHERE table_name = t AND column_name = 'transaction_id'
+            AND data_type <> 'text') THEN
+      EXECUTE format('ALTER TABLE %I ALTER COLUMN transaction_id TYPE TEXT', t);
+      RAISE NOTICE 'migrated %.transaction_id -> TEXT', t;
+    END IF;
+  END LOOP;
+END $$;
+
+-- Webhook OUTBOX columns on an existing bp_decision (added after the table shipped).
+-- ADD COLUMN IF NOT EXISTS is itself idempotent, so this is safe to run every boot.
+ALTER TABLE bp_decision ADD COLUMN IF NOT EXISTS webhook_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE bp_decision ADD COLUMN IF NOT EXISTS webhook_next_attempt_at TIMESTAMP NULL;
+CREATE INDEX IF NOT EXISTS idx_bp_decision_wh_pending
+    ON bp_decision (webhook_next_attempt_at)
+    WHERE webhook_status = 'pending';
+
+-- PER-CURRENCY grain (multi-currency model). Add the `currency` column to existing
+-- profile / peer-baseline / history tables and repoint the primary keys to include it.
+-- Existing rows default to NGN (the ~all-NGN population), and are superseded per currency
+-- by the normal event-driven retrain / one-time --rebuild-all seed. Guarded so the PK
+-- swap (an index rebuild) happens ONCE, not on every boot.
+DO $$
+BEGIN
+  IF to_regclass('bp_user_behaviour_profile') IS NOT NULL THEN
+    ALTER TABLE bp_user_behaviour_profile ADD COLUMN IF NOT EXISTS currency VARCHAR(8) NOT NULL DEFAULT 'NGN';
+    IF NOT EXISTS (SELECT 1 FROM information_schema.key_column_usage
+                    WHERE table_name='bp_user_behaviour_profile'
+                      AND constraint_name='bp_user_behaviour_profile_pkey'
+                      AND column_name='currency') THEN
+      ALTER TABLE bp_user_behaviour_profile DROP CONSTRAINT IF EXISTS bp_user_behaviour_profile_pkey;
+      ALTER TABLE bp_user_behaviour_profile ADD PRIMARY KEY (entity_key, currency);
+      RAISE NOTICE 'bp_user_behaviour_profile -> PK (entity_key, currency)';
+    END IF;
+  END IF;
+  IF to_regclass('bp_peer_baseline') IS NOT NULL THEN
+    ALTER TABLE bp_peer_baseline ADD COLUMN IF NOT EXISTS currency VARCHAR(8) NOT NULL DEFAULT 'NGN';
+    IF NOT EXISTS (SELECT 1 FROM information_schema.key_column_usage
+                    WHERE table_name='bp_peer_baseline'
+                      AND constraint_name='bp_peer_baseline_pkey'
+                      AND column_name='currency') THEN
+      ALTER TABLE bp_peer_baseline DROP CONSTRAINT IF EXISTS bp_peer_baseline_pkey;
+      ALTER TABLE bp_peer_baseline ADD PRIMARY KEY (branch_id, account_type, currency);
+      RAISE NOTICE 'bp_peer_baseline -> PK (branch_id, account_type, currency)';
+    END IF;
+  END IF;
+  IF to_regclass('bp_profile_history') IS NOT NULL THEN
+    ALTER TABLE bp_profile_history ADD COLUMN IF NOT EXISTS currency VARCHAR(8) NULL;
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_bp_profile_entity ON bp_user_behaviour_profile (entity_key);

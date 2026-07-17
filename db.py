@@ -17,11 +17,83 @@ Placeholders stay `%s` in psycopg exactly as in pymysql, so existing SQL carries
 over unchanged; only the dialect-specific pieces above needed replacing.
 """
 import hashlib
+import os
+import threading
+from contextlib import contextmanager
 
 import psycopg
-from psycopg.rows import dict_row
+from psycopg.rows import dict_row, tuple_row
 
 import config
+
+_SCHEMA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema_pg.sql")
+
+# ---------------------------------------------------------------------------
+# Connection pool — reuse established connections instead of opening one per
+# request. Opening a fresh Postgres connection costs ~30ms; a pooled acquire is
+# microseconds. This is what makes POST /score fast. Lazy + thread-safe.
+# ---------------------------------------------------------------------------
+_pool = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool():
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                from psycopg_pool import ConnectionPool
+                _pool = ConnectionPool(
+                    conninfo=config.pg_store_dsn(),
+                    min_size=config.STORE_POOL_MIN, max_size=config.STORE_POOL_MAX,
+                    timeout=config.STORE_POOL_TIMEOUT, open=True, name="behaviour-store",
+                )
+    return _pool
+
+
+@contextmanager
+def pooled(dict_rows: bool = False):
+    """Borrow a connection from the pool; return it automatically on exit.
+
+        with db.pooled() as conn:
+            ...                       # commit yourself, as before
+
+    The pool commits on clean exit and rolls back on exception, then recycles the
+    connection. Use this on the hot path (POST /score). `connect()` (a fresh raw
+    connection) still exists for scripts and background tasks."""
+    pool = _get_pool()
+    with pool.connection() as conn:
+        # ALWAYS set the row factory explicitly on borrow. A pooled connection is reused,
+        # and psycopg does NOT reset a connection-level row_factory on return — so if one
+        # borrower set dict_row and the next expected tuples, `for a, b in fetchall()` would
+        # silently unpack dict KEYS. Resetting here makes every borrow deterministic.
+        conn.row_factory = dict_row if dict_rows else tuple_row
+        yield conn
+
+
+def close_pool():
+    global _pool
+    if _pool is not None:
+        try:
+            _pool.close()
+        finally:
+            _pool = None
+
+
+def ensure_schema() -> None:
+    """Apply schema_pg.sql idempotently (every object is CREATE ... IF NOT EXISTS /
+    CREATE OR REPLACE). The docker-entrypoint init only runs on a FRESH volume, so
+    this is how additive changes (e.g. a new table) reach an EXISTING store on deploy.
+    Safe to run on every startup; a no-op when nothing changed."""
+    if not os.path.exists(_SCHEMA_FILE):
+        return
+    sql = open(_SCHEMA_FILE, encoding="utf-8").read()
+    conn = connect()
+    try:
+        conn.execute(sql)          # psycopg runs a multi-statement script in one call
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def connect():

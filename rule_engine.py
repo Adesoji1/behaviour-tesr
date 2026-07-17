@@ -16,6 +16,7 @@ Usage:
 """
 import argparse
 import json
+import time
 
 import config
 import db
@@ -65,6 +66,80 @@ def profile_is_trusted(p: dict | None) -> tuple[bool, str]:
     return True, "own_profile"
 
 
+# ---------------------------------------------------------------------------
+# Reference-data cache (rules / blacklist / per-client overrides / peer baselines)
+# ---------------------------------------------------------------------------
+# These four tables are small (tens of rows) and change RARELY — only when an admin
+# loads rules (load_rules.py) or edits thresholds (client_thresholds.py). Re-reading
+# them from the DB on every /score was the bulk of the latency. We cache them IN
+# PROCESS (no Redis: the data is tiny, identical per replica, and an extra network hop
+# to Redis would defeat the point) behind a short TTL, refreshed lazily.
+#
+# IMPORTANT — what is NOT cached: the per-customer PROFILE. That is read fresh on every
+# score (see load_profile / the /score handler), because it is the behaviour data that
+# must always be current. Only the rarely-changing rule CATALOGUE is cached, so
+# correctness of a decision is never based on stale behaviour.
+#
+# Staleness bound: a rule/threshold/blacklist change takes effect within TTL seconds
+# (default 30). POST /reload forces an immediate refresh after such a change.
+import threading
+
+
+class _RuleCache:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data: dict | None = None
+        self._loaded_at = 0.0
+
+    def _load(self, conn) -> dict:
+        cur = conn.cursor()
+        cur.execute("SELECT rule_code, params FROM bp_rule_definition WHERE enabled=1")
+        params = {code: json.loads(p or "{}") for code, p in cur.fetchall()}
+        cur.execute("SELECT identifier FROM bp_blacklist WHERE identifier IS NOT NULL")
+        blacklist = {r[0] for r in cur.fetchall()}
+        cur.execute("SELECT branch_id, rule_code, params, enabled FROM bp_rule_settings")
+        overrides: dict[tuple, dict] = {}
+        override_enabled: dict[tuple, int] = {}
+        for branch_id, rule_code, prm, enabled in cur.fetchall():
+            key = (int(branch_id), rule_code)
+            overrides[key] = json.loads(prm or "{}")
+            if enabled is not None:
+                override_enabled[key] = int(enabled)
+        pcur = db.dict_cursor(conn)
+        pcur.execute("SELECT * FROM bp_peer_baseline")
+        # keyed per (branch, account_type, currency) — peers are per-currency too
+        peer = {(int(r["branch_id"]), r["account_type"], r["currency"]): r
+                for r in pcur.fetchall()}
+        return {"params": params, "blacklist": blacklist, "overrides": overrides,
+                "override_enabled": override_enabled, "peer": peer,
+                "rules": len(params), "blacklist_n": len(blacklist), "peer_n": len(peer)}
+
+    def get(self, conn) -> dict:
+        """Return the cached reference data, refreshing from the DB if the TTL expired."""
+        now = time.monotonic()
+        with self._lock:
+            if self._data is None or (now - self._loaded_at) >= config.RULES_CACHE_TTL:
+                self._data = self._load(conn)
+                self._loaded_at = now
+            return self._data
+
+    def refresh(self, conn) -> dict:
+        """Force an immediate reload (POST /reload). Returns a small summary."""
+        with self._lock:
+            self._data = self._load(conn)
+            self._loaded_at = time.monotonic()
+            d = self._data
+        return {"rules": d["rules"], "blacklist": d["blacklist_n"], "peer_baselines": d["peer_n"]}
+
+
+_RULE_CACHE = _RuleCache()
+
+
+def refresh_rule_cache(conn) -> dict:
+    """Public hook for POST /reload — refresh the in-process reference-data cache."""
+    return _RULE_CACHE.refresh(conn)
+
+
 class RuleEngine:
     def __init__(self, conn, velocity=None):
         # `velocity` is an optional live-velocity source (see live_velocity.py):
@@ -72,38 +147,32 @@ class RuleEngine:
         # When present, the fast recent-window rules (1m/10m/15m/1h/24h) evaluate.
         self.conn = conn
         self.velocity = velocity
-        cur = conn.cursor()
-        cur.execute("SELECT rule_code, params FROM bp_rule_definition WHERE enabled=1")
-        self.params = {code: json.loads(p or "{}") for code, p in cur.fetchall()}
-        cur.execute("SELECT identifier FROM bp_blacklist WHERE identifier IS NOT NULL")
-        self.blacklist = {r[0] for r in cur.fetchall()}
-        # per-client (per-branch/institution) threshold overrides — tier-1/2/3 differ
-        cur.execute("SELECT branch_id, rule_code, params, enabled FROM bp_rule_settings")
-        self.overrides: dict[tuple, dict] = {}
-        self.override_enabled: dict[tuple, int] = {}
-        for branch_id, rule_code, prm, enabled in cur.fetchall():
-            key = (int(branch_id), rule_code)
-            self.overrides[key] = json.loads(prm or "{}")
-            if enabled is not None:
-                self.override_enabled[key] = int(enabled)
-        # non-ML cold-start peer baselines (branch_id, account_type) for new accounts
-        pcur = db.dict_cursor(conn)
-        pcur.execute("SELECT * FROM bp_peer_baseline")
-        self.peer: dict[tuple, dict] = {(int(r["branch_id"]), r["account_type"]): r for r in pcur.fetchall()}
+        # Reference data comes from the in-process cache (rarely changes). The
+        # per-customer profile is still read live in evaluate()/load_profile().
+        ref = _RULE_CACHE.get(conn)
+        self.params = ref["params"]
+        self.blacklist = ref["blacklist"]
+        self.overrides = ref["overrides"]
+        self.override_enabled = ref["override_enabled"]
+        self.peer = ref["peer"]
 
-    def _peer_baseline(self, branch_id, account_type) -> dict | None:
-        """Find the peer baseline for a brand-new account: exact (branch, type),
-        then the branch's 'individual'/'unknown' group, then any group in the branch."""
+    def _peer_baseline(self, branch_id, account_type, currency) -> dict | None:
+        """Find the peer baseline for a brand-new account, IN THE TRANSACTION'S CURRENCY:
+        exact (branch, type, ccy), then the branch's 'individual'/'unknown' group in that
+        ccy, then any group in the branch IN THAT CURRENCY. No cross-currency fallback —
+        mixing currencies is exactly the blend we are removing; if there is no peer for
+        this currency the relative peer rules simply don't fire (absolute rules still do)."""
         try:
             b = int(branch_id)
         except (TypeError, ValueError):
             return None
         at = (account_type or "unknown")
-        for k in [(b, at), (b, "individual"), (b, "unknown")]:
+        ccy = config.normalize_currency(currency)
+        for k in [(b, at, ccy), (b, "individual", ccy), (b, "unknown", ccy)]:
             if k in self.peer:
                 return self.peer[k]
-        for (pb, _), v in self.peer.items():
-            if pb == b:
+        for (pb, _, pc), v in self.peer.items():
+            if pb == b and pc == ccy:
                 return v
         return None
 
@@ -128,16 +197,22 @@ class RuleEngine:
             return set()
         return {code for (ob, code), en in self.override_enabled.items() if ob == b and en == 0}
 
-    def load_profile(self, entity_key: str) -> dict | None:
+    def load_profile(self, entity_key: str, currency=None) -> dict | None:
+        """The profile for THIS customer IN THIS CURRENCY. No row for the currency ->
+        None -> the cold-start / peer path runs (per-currency), exactly as for a new
+        account. `currency` is normalized so it matches how the profile was stored."""
+        ccy = config.normalize_currency(currency)
         cur = db.dict_cursor(self.conn)
-        cur.execute("SELECT * FROM bp_user_behaviour_profile WHERE entity_key=%s", (entity_key,))
+        cur.execute("SELECT * FROM bp_user_behaviour_profile WHERE entity_key=%s AND currency=%s",
+                    (entity_key, ccy))
         return cur.fetchone()
 
-    def _eval_cold_start(self, txn, amt, oc, params, fire, tag):
+    def _eval_cold_start(self, txn, amt, oc, params, fire, tag, currency=None):
         """Judge a not-yet-trusted account (new / Warming Up / low confidence)
-        against its PEER baseline instead of its own thin history. Non-ML."""
+        against its PEER baseline IN THIS CURRENCY instead of its own thin history. Non-ML."""
         base = self._peer_baseline(txn.get("branch_id"),
-                                   txn.get("account_type") or txn.get("origin_account_type"))
+                                   txn.get("account_type") or txn.get("origin_account_type"),
+                                   currency)
         if base is None:
             return
         pr = params.get("block_significantly_high_amount", {})
@@ -164,10 +239,11 @@ class RuleEngine:
                 fire("unusual_time_for_user", "low", hour=hr, basis=tag)
 
     def _eval_velocity(self, txn, amt, params, fire):
-        """Fire the recent-window velocity rules using the live look-up.
-        The current transaction is counted in (the +1 / +amt)."""
+        """Fire the recent-window velocity rules using the recent-window look-up.
+        The current transaction is counted in (the +1 / +amt). Passes the engine's own
+        connection so the LOCAL source reuses it (no second pooled connection per score)."""
         v = self.velocity.features(txn.get("branch_id"), txn.get("origin_account_no"),
-                                   txn.get("ts"), amt)
+                                   txn.get("ts"), amt, conn=self.conn)
 
         pr = params.get("transaction_velocity_1m", {})
         if v["n_1m"] + 1 > pr.get("max_count", 3):
@@ -200,7 +276,8 @@ class RuleEngine:
     def evaluate(self, txn: dict) -> list[dict]:
         """Return a list of fired rules for one incoming transaction."""
         ek = f"{txn['branch_id']}:{txn['origin_account_no']}"
-        p = self.load_profile(ek)
+        ccy = config.normalize_currency(txn.get("currency"))
+        p = self.load_profile(ek, ccy)      # THIS customer's profile IN THIS currency
         fired: list[dict] = []
 
         # thresholds resolved for THIS client (institution), with global fallback
@@ -215,9 +292,17 @@ class RuleEngine:
         amt = float(txn.get("amount") or 0)
 
         # ---- hard-condition rules (no profile needed) ----
-        pr = params.get("escalate_single_transfer_above_10m_ngn", {})
-        if txn.get("currency") == "NGN" and amt > pr.get("max_amount", 1e12):
-            fire("escalate_single_transfer_above_10m_ngn", "high", amount=amt)
+        # PER-CURRENCY single-transfer escalation — multi-currency by design. Any rule
+        # whose params carry a `currency` + `max_amount` fires when the transaction is in
+        # that currency and exceeds that threshold. So NGN (10m) and USD (10k) both work
+        # today, and EUR/GBP/... are pure DATA: add a bp_rule_definition row, no code
+        # change. This replaces the old hard-coded `currency == "NGN"` check so the system
+        # is not restricted to Nigeria (per the DB engineer).
+        for _code, _prm in params.items():
+            if (isinstance(_prm, dict) and "currency" in _prm and "max_amount" in _prm
+                    and ccy == config.normalize_currency(_prm["currency"])
+                    and amt > _prm["max_amount"]):
+                fire(_code, "high", amount=amt, currency=ccy, threshold=_prm["max_amount"])
 
         pr = params.get("block_above_hard_cap", {})
         if amt > pr.get("hard_cap", 1e18):
@@ -247,7 +332,7 @@ class RuleEngine:
         # trusted baseline from a little fake activity.
         trusted, tag = profile_is_trusted(p)
         if not trusted:
-            self._eval_cold_start(txn, amt, oc, params, fire, tag)
+            self._eval_cold_start(txn, amt, oc, params, fire, tag, ccy)
             return fired
 
         if p["is_blacklisted"]:

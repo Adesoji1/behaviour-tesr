@@ -34,3 +34,4 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+migrate_dumps/

@@ -47,7 +47,8 @@ class CsvVelocitySource:
             .dt.convert_time_zone("UTC").dt.replace_time_zone(None).alias("ts"),
         )
 
-    def features(self, branch_id, account_no, as_of, current_amount: float = 0.0) -> dict:
+    def features(self, branch_id, account_no, as_of, current_amount: float = 0.0,
+                 conn=None) -> dict:
         if as_of is None:
             return _empty()
         d = self.df.filter(
@@ -77,7 +78,8 @@ class ProdVelocitySource:
     This is the production path; it uses the existing (origin_account_no,
     date_created) index so the lookup stays sub-second even at billions of rows."""
 
-    def features(self, branch_id, account_no, as_of, current_amount: float = 0.0) -> dict:
+    def features(self, branch_id, account_no, as_of, current_amount: float = 0.0,
+                 conn=None) -> dict:
         import os
         import subprocess
         if as_of is None:
@@ -102,14 +104,20 @@ class ProdVelocitySource:
         """
         env = dict(os.environ)
         env["PGPASSWORD"] = config.PROD_PG["password"]
+        env["PGSSLMODE"] = config.PROD_PG["sslmode"]
+        # POOLER-SAFE: --single-transaction + SET LOCAL (scoped, reset on COMMIT), -q so
+        # BEGIN/SET/COMMIT tags are not printed. See sync_manager for the rationale.
         out = subprocess.check_output(
             ["psql", "-h", config.PROD_PG["host"], "-p", str(config.PROD_PG["port"]),
              "-U", config.PROD_PG["user"], "-d", config.PROD_PG["dbname"],
-             "--set=sslmode=require", "-t", "-A", "-F", "|",
-             "-c", "SET default_transaction_read_only = on;", "-c", q],
+             "-q", "-t", "-A", "-F", "|", "--single-transaction",
+             "-c", f"SET LOCAL statement_timeout = {int(config.SYNC_STATEMENT_TIMEOUT_MS)}",
+             "-c", "SET LOCAL transaction_read_only = on", "-c", q],
             env=env, text=True,
-        ).strip()
-        vals = out.split("|")
+        )
+        # keep only the SELECT's data line (defensive against any stray command tag)
+        _lines = [l for l in out.splitlines() if l.strip() and l.strip() not in ("BEGIN", "SET", "COMMIT")]
+        vals = (_lines[-1] if _lines else "").split("|")
         keys = ["n_1m", "amt_1m", "n_10m", "n_15m", "amt_15m", "n_1h", "recip_1h", "countries_1h", "n_24h", "benef_24h"]
         f = _empty()
         for k, v in zip(keys, vals):
@@ -118,3 +126,92 @@ class ProdVelocitySource:
             except ValueError:
                 pass
         return f
+
+
+class LocalVelocitySource:
+    """Recent-activity lookup from the LOCAL `bp_recent_txn` table — the transactions this
+    service has ITSELF seen at POST /score. Real-time, ~ms, and NO production read (this is
+    what replaced the per-score production query). One conditional-aggregation query over
+    the indexed (entity_key, ts). Reads its own pooled connection so it sees only committed
+    prior transactions — the current one is recorded AFTER scoring, so it is never
+    double-counted (the rules add the +1 for the current transaction themselves)."""
+
+    def features(self, branch_id, account_no, as_of, current_amount: float = 0.0,
+                 conn=None) -> dict:
+        import db
+        if as_of is None:
+            return _empty()
+        entity_key = f"{int(branch_id)}:{account_no}"
+        sql = """
+        SELECT
+          count(*) FILTER (WHERE ts > %(t)s - interval '1 minute')  AS n_1m,
+          coalesce(sum(amount) FILTER (WHERE ts > %(t)s - interval '1 minute'),0) AS amt_1m,
+          count(*) FILTER (WHERE ts > %(t)s - interval '10 minutes') AS n_10m,
+          count(*) FILTER (WHERE ts > %(t)s - interval '15 minutes') AS n_15m,
+          coalesce(sum(amount) FILTER (WHERE ts > %(t)s - interval '15 minutes'),0) AS amt_15m,
+          count(*) FILTER (WHERE ts > %(t)s - interval '1 hour')     AS n_1h,
+          count(DISTINCT destination_account_no) FILTER (WHERE ts > %(t)s - interval '1 hour') AS recip_1h,
+          count(DISTINCT origin_country) FILTER (WHERE ts > %(t)s - interval '1 hour') AS countries_1h,
+          count(*) AS n_24h,
+          count(DISTINCT destination_account_no) AS benef_24h
+        FROM bp_recent_txn
+        WHERE entity_key = %(ek)s AND ts > %(t)s - interval '24 hours' AND ts <= %(t)s
+        """
+        keys = ["n_1m", "amt_1m", "n_10m", "n_15m", "amt_15m", "n_1h", "recip_1h",
+                "countries_1h", "n_24h", "benef_24h"]
+        try:
+            if conn is not None:                 # reuse the engine's connection (no 2nd conn)
+                cur = conn.cursor()
+                cur.execute(sql, {"ek": entity_key, "t": as_of})
+                row = cur.fetchone()
+            else:
+                with db.pooled() as c:
+                    cur = c.cursor()
+                    cur.execute(sql, {"ek": entity_key, "t": as_of})
+                    row = cur.fetchone()
+        except Exception:                       # velocity must never break scoring
+            return _empty()
+        f = _empty()
+        if row:
+            for k, v in zip(keys, row):
+                f[k] = float(v or 0) if "amt" in k else int(v or 0)
+        return f
+
+
+def record_txn(conn, entity_key, ts, amount, destination_account_no,
+               origin_country, destination_country, currency) -> None:
+    """Record ONE scored transaction into the recent-window table, on the caller's
+    connection (so it commits with the decision). This is what makes the NEXT
+    transactions' velocity rules see it. Never raises — recording must not break scoring."""
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO bp_recent_txn (entity_key, ts, amount, destination_account_no, "
+            "origin_country, destination_country, currency) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (entity_key, ts, amount, destination_account_no, origin_country,
+             destination_country, currency))
+    except Exception as e:
+        import audit
+        audit.log.warning("recent-txn record failed for %s: %s", entity_key, e)
+
+
+def prune_recent(retain_hours: float | None = None) -> int:
+    """Delete recent-window rows older than the retention window (default from config).
+    Runs off the hot path (a /score background task, occasionally). Returns rows removed."""
+    import db
+    hours = retain_hours if retain_hours is not None else config.VELOCITY_RETAIN_HOURS
+    try:
+        conn = db.connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM bp_recent_txn WHERE ts < now() - (%s || ' hours')::interval",
+                        (str(int(hours)),))
+            n = cur.rowcount
+            conn.commit()
+            return n or 0
+        finally:
+            conn.close()
+    except Exception as e:
+        import audit
+        audit.log.warning("recent-txn prune failed: %s", e)
+        return 0

@@ -111,7 +111,11 @@ def fetch_customer(branch_id, account_no, conn=None):
 
         # Tenure: carry forward from the stored profile; the cache alone cannot
         # see beyond the learning window.
-        cur.execute("SELECT tenure_days, lifetime_clean_txns, last_retrained_at "
+        # Customer-level tenure across ALL of their currency rows: account age is a
+        # customer property (take the max), last_retrained_at the latest.
+        cur.execute("SELECT MAX(tenure_days) AS tenure_days, "
+                    "MAX(lifetime_clean_txns) AS lifetime_clean_txns, "
+                    "MAX(last_retrained_at) AS last_retrained_at "
                     "FROM bp_user_behaviour_profile WHERE entity_key=%s", (entity_key,))
         prev = cur.fetchone()
         cache_span = 0
@@ -152,8 +156,12 @@ def _jnum(x):
     return x
 
 
-def compute_customer_profile(df: pl.DataFrame, entity_key: str, prev: dict | None, tenure: dict) -> dict:
-    """Compute one customer's profile row (same fields as the batch builder)."""
+def compute_customer_profile(df: pl.DataFrame, entity_key: str, prev: dict | None, tenure: dict,
+                             currency: str | None = None) -> dict:
+    """Compute one customer's profile row FOR ONE CURRENCY (same fields as the batch
+    builder). `df` must already be filtered to `currency`; the amount stats it produces
+    (max/p95/avg/…) are therefore per-currency, so a NGN and a USD profile never blend."""
+    currency = config.normalize_currency(currency) if currency else config.DEFAULT_CURRENCY
     now = datetime.utcnow()
     df = df.with_columns(
         pl.col("amount").cast(pl.Float64, strict=False),
@@ -203,7 +211,8 @@ def compute_customer_profile(df: pl.DataFrame, entity_key: str, prev: dict | Non
     last_location = last_row["customer_location"][0] if last_row.height else None
     last_country = last_row["origin_country"][0] if last_row.height else None
     prof = {
-        "entity_key": entity_key, "branch_id": int(branch_id), "origin_account_no": account_no,
+        "entity_key": entity_key, "currency": currency,
+        "branch_id": int(branch_id), "origin_account_no": account_no,
         "customer_name": df["customer_name"].drop_nulls().first() if df.height else None,
         "identifier": df["identifier"].drop_nulls().first() if df.height else None,
         "account_type": df["account_type"].drop_nulls().first() if df.height else None,
@@ -327,7 +336,7 @@ def retrain_customer(entity_key: str, trigger: str = "manual") -> dict:
         return {"entity_key": entity_key, "retrained": False, "reason": "busy"}
     try:
         cur.execute("SELECT * FROM bp_user_behaviour_profile WHERE entity_key=%s", (entity_key,))
-        prev = cur.fetchone()
+        prev_by_ccy = {r["currency"]: r for r in cur.fetchall()}
         df, tenure = fetch_customer(branch_id, account_no, conn=conn)
         if df is None or df.height == 0:
             # "nothing to learn from" has THREE very different causes and they must not be
@@ -336,42 +345,72 @@ def retrain_customer(entity_key: str, trigger: str = "manual") -> dict:
             diag = _diagnose_empty(conn, entity_key)
             log_event(entity_key, "retrain_skip", diag["reason"], diag)
             return {"entity_key": entity_key, "retrained": False, **diag}
-        prof = compute_customer_profile(df, entity_key, prev, tenure)
-        cols = list(prof.keys())
-        cur.execute(db.upsert_sql("bp_user_behaviour_profile", cols, ["entity_key"]),
-                    [prof[c] for c in cols])
-        cur.execute("INSERT INTO bp_profile_history (entity_key, build_run_id, profile_version, "
-                    "total_tx_count, total_tx_amount, avg_amount, decayed_avg_amount, profile_json) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (entity_key, "event", prof["profile_version"], prof["total_tx_count"],
-                     prof["total_tx_amount"], prof["avg_amount"], prof["decayed_avg_amount"],
-                     json.dumps(prof, default=str) if config.STORE_HISTORY_JSON else None))
-        conn.commit()                            # <-- profile is now SAVED in PostgreSQL
-        # Explicit, visible proof of the WRITE — which database, which host, which table,
-        # which row, which version. So "it learnt and saved it" is never just a claim.
+
+        # ONE profile per (normalized) currency. Amount stats are computed WITHIN each
+        # currency, so a customer's NGN and USD baselines never blend. skip_nulls=False so
+        # an untagged currency normalizes to the default (NGN) rather than a null group.
+        df = df.with_columns(
+            pl.col("currency").map_elements(config.normalize_currency,
+                                            return_dtype=pl.Utf8, skip_nulls=False).alias("_ccy"))
+        tenure_days = int(tenure.get("tenure_days") or 0)   # customer-level (account age)
+        fraud_txns = int(tenure.get("fraud_txns") or 0)     # customer-level (fraud is per customer)
+        # dominant currency first (most rows) so the summary/return reflects it
+        ccy_order = (df.group_by("_ccy").agg(pl.len().alias("n"))
+                       .sort("n", descending=True)["_ccy"].to_list())
+
+        built = []
+        for ccy in ccy_order:
+            gdf = df.filter(pl.col("_ccy") == ccy)
+            prev_c = prev_by_ccy.get(ccy)
+            # lifetime_clean_txns: carry the per-currency authoritative figure forward when
+            # we have a prior row for THIS currency; else fall back to the window count,
+            # which under-states and so keeps a thin/rare currency in warming_up (peer-judged).
+            life = (int(prev_c["lifetime_clean_txns"])
+                    if prev_c and (prev_c.get("lifetime_clean_txns") or 0) > 0 else int(gdf.height))
+            tenure_c = {"tenure_days": tenure_days, "lifetime_clean_txns": life,
+                        "fraud_txns": fraud_txns}
+            prof = compute_customer_profile(gdf, entity_key, prev_c, tenure_c, ccy)
+            cols = list(prof.keys())
+            cur.execute(db.upsert_sql("bp_user_behaviour_profile", cols, ["entity_key", "currency"]),
+                        [prof[c] for c in cols])
+            cur.execute("INSERT INTO bp_profile_history (entity_key, currency, build_run_id, "
+                        "profile_version, total_tx_count, total_tx_amount, avg_amount, "
+                        "decayed_avg_amount, profile_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (entity_key, ccy, "event", prof["profile_version"], prof["total_tx_count"],
+                         prof["total_tx_amount"], prof["avg_amount"], prof["decayed_avg_amount"],
+                         json.dumps(prof, default=str) if config.STORE_HISTORY_JSON else None))
+            built.append(prof)
+        conn.commit()                            # <-- profile(s) now SAVED in PostgreSQL
+
+        primary = built[0]                       # dominant currency
+        # Explicit, visible proof of the WRITE — host, db, which currency rows + versions.
         audit.log.info(
-            "DB WRITE ok | entity=%s -> postgres://%s:%s/%s | tables: "
-            "bp_user_behaviour_profile (upsert, version %s), bp_profile_history (append) | "
-            "learned from %s cached txns",
-            entity_key, config.STORE_PG["host"], config.STORE_PG["port"],
-            config.STORE_PG["dbname"], prof["profile_version"], prof["total_tx_count"])
+            "DB WRITE ok | entity=%s -> postgres://%s:%s/%s | bp_user_behaviour_profile "
+            "upsert %d currency row(s): %s | learned from %s cached txns",
+            entity_key, config.STORE_PG["host"], config.STORE_PG["port"], config.STORE_PG["dbname"],
+            len(built), ", ".join(f"{p['currency']} v{p['profile_version']}" for p in built),
+            sum(p["total_tx_count"] for p in built))
         learned = {
             # a COUNT of transactions the profile was learned from — not money, not days
-            "learned_from_txn_count": prof["total_tx_count"],
-            "usual_avg_amount_ngn": prof["avg_amount"],
-            "recency_weighted_avg_ngn": prof["decayed_avg_amount"],
-            "biggest_ever_ngn": prof["max_amount"],
-            "usual_cities": list(json.loads(prof["usual_cities"] or "{}"))[:5],
-            "busiest_day": prof["top_day_of_week"],
+            "learned_from_txn_count": primary["total_tx_count"],
+            "currency": primary["currency"],
+            "usual_avg_amount": primary["avg_amount"],
+            "recency_weighted_avg": primary["decayed_avg_amount"],
+            "biggest_ever": primary["max_amount"],
+            "usual_cities": list(json.loads(primary["usual_cities"] or "{}"))[:5],
+            "busiest_day": primary["top_day_of_week"],
         }
         out = {"entity_key": entity_key, "retrained": True, "trigger": trigger,
                "saved_to": "PostgreSQL · bp_user_behaviour_profile",
                "learned_from": "local cache (bp_transactions_cache) — production untouched",
-               "version": prof["profile_version"], "status": prof["profile_status"],
-               "confidence": prof["confidence_score"], "drift": prof["drift_status"],
+               "currencies": [{"currency": p["currency"], "version": p["profile_version"],
+                               "status": p["profile_status"], "confidence": p["confidence_score"],
+                               "learned_from_txn_count": p["total_tx_count"]} for p in built],
+               "version": primary["profile_version"], "status": primary["profile_status"],
+               "confidence": primary["confidence_score"], "drift": primary["drift_status"],
                "learned": learned}
-        # explicit, human-readable proof in the logs that a fresh behaviour was
-        # learnt AND persisted — so Anita can see exactly what the system saved.
+        # explicit, human-readable proof in the logs that fresh behaviour was learnt AND
+        # persisted — so Anita can see exactly what the system saved, per currency.
         log_event(entity_key, "retrain", "learned_and_saved", out)
         return out
     except Exception as e:                       # retrain failure is LOGGED, not swallowed silently
@@ -386,19 +425,24 @@ def retrain_customer(entity_key: str, trigger: str = "manual") -> dict:
 def retrain_decision(entity_key: str) -> dict:
     """Evaluate the OR-triggers for a customer WITHOUT retraining. Returns the full
     breakdown (each check + whether met + how far off), so 'why / why not' is explicit.
-    Reads only the profile store — no production, no cache."""
-    conn = db.connect()
-    cur = db.dict_cursor(conn)
-    cur.execute("SELECT txns_since_build, drift_signal_count, last_retrained_at "
-                "FROM bp_user_behaviour_profile WHERE entity_key=%s", (entity_key,))
-    p = cur.fetchone()
-    conn.close()
-    if p is None:
+    Reads only the profile store — no production, no cache. Runs after EVERY /score, so it
+    uses the POOL (an established connection) — a fresh connect here would dominate latency
+    under load."""
+    # A customer now has one row per currency; retrain (which rebuilds ALL their currencies)
+    # is due if ANY currency crosses a trigger. Aggregate: MAX new-txn / drift counters, and
+    # the OLDEST (MIN) last_retrained_at so the most stale currency drives the age check.
+    with db.pooled() as conn:
+        cur = db.dict_cursor(conn)          # cursor-scoped dict rows (does not touch the conn)
+        cur.execute("SELECT MAX(txns_since_build) AS nt, MAX(drift_signal_count) AS dr, "
+                    "MIN(last_retrained_at) AS oldest, COUNT(*) AS n "
+                    "FROM bp_user_behaviour_profile WHERE entity_key=%s", (entity_key,))
+        p = cur.fetchone()
+    if p is None or int(p["n"] or 0) == 0:
         return {"has_profile": False,
                 "reason": "no profile yet — customer is new/Warming-Up, judged against peers"}
-    nt = int(p["txns_since_build"] or 0)
-    ds = (datetime.utcnow() - p["last_retrained_at"]).days if p["last_retrained_at"] else None
-    dr = int(p["drift_signal_count"] or 0)
+    nt = int(p["nt"] or 0)
+    ds = (datetime.utcnow() - p["oldest"]).days if p["oldest"] else None
+    dr = int(p["dr"] or 0)
     checks = {
         "new_transactions": {"value": nt, "threshold": config.RETRAIN_MIN_NEW_TXNS, "met": nt >= config.RETRAIN_MIN_NEW_TXNS},
         "days_since_build": {"value": ds, "threshold": config.RETRAIN_MAX_AGE_DAYS,
@@ -427,10 +471,76 @@ def maybe_retrain(entity_key: str) -> dict:
     return retrain_customer(entity_key, trigger=d["trigger"])
 
 
+def rebuild_all_from_cache(min_rows: int | None = None, limit: int | None = None) -> dict:
+    """ONE-TIME batch (re)build of profiles from the local cache — the initial SEED,
+    the modern equivalent of build_profiles.py (reads the cache instead of a CSV).
+
+    This is NOT a cron and NOT auto-fired. Steady-state refresh stays purely
+    event-driven per customer (maybe_retrain). Run this ONCE after the cache has fully
+    backfilled to get a clean, current snapshot of every profile:
+
+        python retrain.py --rebuild-all
+
+    It rebuilds each customer via the SAME per-customer path used at runtime
+    (retrain_customer) — same clean-only filter, §1 gate, drift, carry-forward — so a
+    batch profile is identical to an event-driven one. Per-customer locked and safe to
+    re-run or resume (each customer is independent).
+    """
+    min_rows = config.REBUILD_MIN_ROWS if min_rows is None else min_rows
+    conn = db.connect()
+    cur = db.dict_cursor(conn)
+    cur.execute(
+        "SELECT entity_key, count(*) AS n FROM bp_transactions_cache "
+        f"WHERE date_created >= (now() - interval '{int(config.LOOKBACK_MONTHS)} months') "
+        "GROUP BY entity_key HAVING count(*) >= %s ORDER BY count(*) DESC",
+        (min_rows,),
+    )
+    keys = [r["entity_key"] for r in cur.fetchall()]
+    conn.close()
+    if limit:
+        keys = keys[:limit]
+
+    total = len(keys)
+    audit.log.info("rebuild_all START — %d customers in cache (min_rows=%d). This is a "
+                   "ONE-TIME seed; steady-state refresh remains event-driven.", total, min_rows)
+    built = skipped = failed = 0
+    for i, ek in enumerate(keys, 1):
+        try:
+            out = retrain_customer(ek, trigger="batch_rebuild")
+            if out.get("retrained"):
+                built += 1
+            else:
+                skipped += 1
+        except Exception as e:                       # never let one customer stop the seed
+            failed += 1
+            audit.log.warning("rebuild_all: %s failed: %s", ek, e)
+        if i % 500 == 0 or i == total:
+            audit.log.info("rebuild_all progress %d/%d (built=%d skipped=%d failed=%d)",
+                           i, total, built, skipped, failed)
+    summary = {"customers": total, "built": built, "skipped": skipped, "failed": failed}
+    audit.log.info("rebuild_all DONE %s", summary)
+    return summary
+
+
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("entity_key", help="e.g. 231:1100716290")
-    ap.add_argument("--force", action="store_true")
+    ap = argparse.ArgumentParser(description="Per-customer retrain, or the one-time "
+                                             "batch seed of all profiles from the cache.")
+    ap.add_argument("entity_key", nargs="?", help="e.g. 231:1100716290")
+    ap.add_argument("--force", action="store_true", help="force this customer's retrain now")
+    ap.add_argument("--rebuild-all", action="store_true",
+                    help="ONE-TIME: rebuild every cached customer's profile (initial seed)")
+    ap.add_argument("--min-rows", type=int, default=None,
+                    help="with --rebuild-all: only rebuild customers with >= this many cached rows")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="with --rebuild-all: cap how many customers (for a quick trial)")
     a = ap.parse_args()
-    print(retrain_customer(a.entity_key) if a.force else maybe_retrain(a.entity_key))
+
+    import json
+    if a.rebuild_all:
+        print(json.dumps(rebuild_all_from_cache(min_rows=a.min_rows, limit=a.limit), indent=2))
+    elif a.entity_key:
+        print(json.dumps(retrain_customer(a.entity_key) if a.force
+                         else maybe_retrain(a.entity_key), indent=2, default=str))
+    else:
+        ap.error("give an entity_key, or --rebuild-all")

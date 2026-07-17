@@ -28,7 +28,9 @@ import db
 
 # table -> primary key columns (for the ON CONFLICT upsert)
 TABLES = {
-    "bp_user_behaviour_profile": ["entity_key"],
+    # per-currency grain: the old MySQL profiles predate `currency`, so the copied rows
+    # omit it and default to NGN in Postgres; the conflict target must match the new PK.
+    "bp_user_behaviour_profile": ["entity_key", "currency"],
     "bp_rule_definition":        ["rule_code"],
     "bp_rule_settings":          ["branch_id", "rule_code"],
     "bp_peer_baseline":          ["branch_id", "account_type"],

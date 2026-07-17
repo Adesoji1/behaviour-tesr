@@ -168,7 +168,7 @@ editable in **Django Admin** (see §6).
 | GET | `/health` | liveness (for k8s/load-balancer) |
 | GET | `/demo` | **run the whole pipeline end-to-end through the service** and return every stage with its real result (the API version of `demo_end_to_end.sh`) |
 | GET | `/stats` | system totals: profiles, Active/Warming-Up split, drift, rules |
-| POST | `/score` | score one transaction (+ maybe retrain) — the adhere hook |
+| POST | `/score` | **the live decision hook** — fast `allow`/`review` + fired rules; the decision is returned, delivered by webhook (`BP_SCORE_WEBHOOK_URL`), and saved to `bp_decision` for audit. Retrain runs in the background so it never slows the response. |
 | GET | `/customer/{entity_key}` | **full status of one customer**: eligibility (met/not), what was learned, retrain state (why it will/won't retrain next), and their recent event trail |
 | GET | `/profile/{entity_key}` | raw stored profile row |
 | POST | `/retrain/{entity_key}` | force a retrain now |

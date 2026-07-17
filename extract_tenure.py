@@ -46,11 +46,15 @@ def main() -> int:
     copy_cmd = f"\\copy ({TENURE_SQL}) TO '{out}' WITH (FORMAT csv, HEADER true)"
     env = dict(os.environ)
     env["PGPASSWORD"] = config.PROD_PG["password"]
+    env["PGSSLMODE"] = config.PROD_PG["sslmode"]
+    # POOLER-SAFE: --single-transaction + SET LOCAL (scoped to the transaction, reset on
+    # COMMIT) so nothing leaks through PgBouncer. See extract_transactions.py.
     psql = [
         "psql", "-h", config.PROD_PG["host"], "-p", str(config.PROD_PG["port"]),
         "-U", config.PROD_PG["user"], "-d", config.PROD_PG["dbname"],
-        "--set=sslmode=require",
-        "-c", "SET default_transaction_read_only = on;",
+        "--single-transaction",
+        "-c", f"SET LOCAL statement_timeout = {int(config.SYNC_STATEMENT_TIMEOUT_MS)}",
+        "-c", "SET LOCAL transaction_read_only = on",
         "-c", copy_cmd,
     ]
     print(f"[tenure] -> {out}")

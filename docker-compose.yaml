@@ -4,7 +4,9 @@
 #   docker compose up -d --build
 #   docker compose logs -f
 #
-# Service:  http://localhost:8080   (docs /docs, demo /demo, sync /sync)
+# Service:  http://localhost:8080   (docs /docs, demo /demo)
+# Sync:     a SEPARATE background service pulls production on a schedule (the ONLY
+#           production reader) — it is NOT triggered by any HTTP request.
 # Store:    PostgreSQL 17 on 127.0.0.1:5432 (loopback only — never published wide)
 #
 # The store lives in a NAMED VOLUME: it survives `docker compose down`.
@@ -54,6 +56,10 @@ services:
     environment:
       STORE_PG_HOST: db                 # reach the store over the compose network
       STORE_PG_PORT: 5432
+    volumes:
+      # The database engineer reads the exact JSON every GET /demo returns here.
+      # Container writes to /app/logs/demo (config.DEMO_LOG_DIR); host sees ./logs/demo.
+      - ./logs:/app/logs
     depends_on:
       db:
         condition: service_healthy      # never start before the store is ready
@@ -69,6 +75,72 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  # SCHEDULED INGESTION — the ONLY production reader. Runs sync_manager in a loop
+  # every BP_SYNC_INTERVAL_SECONDS. Keep this at ONE instance (do NOT scale it) so
+  # production always has exactly one reader. It is decoupled from the API: if it
+  # stops, scoring keeps working from the last synced cache.
+  # In Kubernetes this is a CronJob instead (see README "Scheduled ingestion").
+  # ---------------------------------------------------------------------------
+  sync:
+    build: .
+    image: adhere-behaviour:latest
+    container_name: adhere-behaviour-sync
+    command: ["python", "sync_manager.py", "--loop"]
+    env_file:
+      - .env
+    environment:
+      STORE_PG_HOST: db
+      STORE_PG_PORT: 5432
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    # This service does NOT serve HTTP, so disable the image's HTTP health check.
+    # Liveness = the process: the --loop catches every error and never exits, and
+    # `restart: unless-stopped` covers a hard crash. Watch progress in GET /sync/status.
+    healthcheck:
+      test: ["NONE"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  # LOAD TEST (opt-in) — Locust against POST /score. Never starts by default; run it
+  # explicitly with the `loadtest` profile:
+  #   docker compose --profile loadtest run --rm loadtest
+  # All knobs are env-driven (LOCUST_USERS / LOCUST_SPAWN_RATE / LOCUST_RUN_TIME /
+  # SCORE_SLA_MS / SCORE_LOAD_ENTITY_KEYS). Results land in ./logs/loadtest/.
+  # ---------------------------------------------------------------------------
+  loadtest:
+    image: locustio/locust:latest
+    container_name: adhere-loadtest
+    profiles: ["loadtest"]                 # excluded from normal `up`
+    depends_on:
+      behaviour-profile:
+        condition: service_healthy
+    volumes:
+      - ./locustfile.py:/mnt/locust/locustfile.py:ro
+      - ./logs:/mnt/logs                   # host sees results under ./logs/loadtest/
+    environment:
+      SCORE_SLA_MS: ${SCORE_SLA_MS:-600}
+      SCORE_LOAD_ENTITY_KEYS: ${SCORE_LOAD_ENTITY_KEYS:-}
+      SCORE_ABNORMAL_PCT: ${SCORE_ABNORMAL_PCT:-0.10}
+      SCORE_WAIT_MIN: ${SCORE_WAIT_MIN:-0.0}
+      SCORE_WAIT_MAX: ${SCORE_WAIT_MAX:-0.05}
+    command: >
+      -f /mnt/locust/locustfile.py
+      --host http://behaviour-profile:8080
+      --headless
+      --users ${LOCUST_USERS:-50}
+      --spawn-rate ${LOCUST_SPAWN_RATE:-10}
+      --run-time ${LOCUST_RUN_TIME:-60s}
+      --csv /mnt/logs/loadtest/score
+      --html /mnt/logs/loadtest/score.html
+      --logfile /mnt/logs/loadtest/locust.log
 
 volumes:
   pgdata17:                             # named volume — the profile store lives here

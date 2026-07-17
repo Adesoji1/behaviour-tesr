@@ -92,15 +92,19 @@ def main() -> int:
 
     env = dict(os.environ)
     env["PGPASSWORD"] = config.PROD_PG["password"]
+    env["PGSSLMODE"] = config.PROD_PG["sslmode"]
+    # POOLER-SAFE (PgBouncer on port 25061): --single-transaction wraps every -c in one
+    # BEGIN..COMMIT, so SET LOCAL is scoped to that transaction and reset on COMMIT — it
+    # never leaks to the next pooled client. A plain session SET would corrupt the pool.
     psql = [
         "psql",
         "-h", config.PROD_PG["host"],
         "-p", str(config.PROD_PG["port"]),
         "-U", config.PROD_PG["user"],
         "-d", config.PROD_PG["dbname"],
-        "--set=sslmode=require",
-        # hard read-only guard for the whole session
-        "-c", "SET default_transaction_read_only = on;",
+        "--single-transaction",
+        "-c", f"SET LOCAL statement_timeout = {int(config.SYNC_STATEMENT_TIMEOUT_MS)}",
+        "-c", "SET LOCAL transaction_read_only = on",
         "-c", copy_cmd,
     ]
     print(f"[extract] months={args.months} branch={args.branch} limit={args.limit}")

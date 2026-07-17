@@ -504,7 +504,7 @@ cache problem is never mistaken for a compliance signal:
 | GET | `/customers` | **browse customers + entity keys** (`?trusted=`, `?q=`, `?limit=`), each with a ready-made demo URL |
 | POST | `/sync` | **pull fresh production data into the cache, safely** |
 | GET | `/sync/status` | watermark + cache contents |
-| POST | `/score` | score one transaction (+ maybe retrain) — the adhere hook |
+| POST | `/score` | **the live production hook** — fast decision (`allow`/`review` + fired rules), delivered by webhook, saved to `bp_decision` for audit. See [§11](#11-post-score--the-live-decision-hook). |
 | GET | `/customer/{entity_key}` | full status of one customer |
 | GET | `/profile/{entity_key}` | raw stored profile row |
 | POST | `/retrain/{entity_key}` | force a retrain now (from the cache) |
@@ -592,4 +592,112 @@ docker exec -it behaviour-profile-db psql -U behaviour -d behaviour
 # \dt                                    list tables
 # SELECT count(*) FROM bp_user_behaviour_profile;
 # SELECT * FROM bp_sync_state;           the ingestion watermark
+```
+
+## 11. POST /score — the live decision hook
+
+This is the endpoint the transaction engine calls per transaction. It is built to be
+**fast**: it reads the profile, scores, decides, and returns — nothing slow blocks the
+caller.
+
+```text
+transaction ─▶ POST /score ─▶ get profile from Postgres ─▶ compare behaviour
+            ─▶ decide risk ─▶ return decision (fast)
+                                   │  after responding, in the background:
+                                   ├─▶ deliver the decision to the webhook
+                                   └─▶ retrain this customer if a trigger is met
+            (the full analysis is saved to bp_decision for audit, before responding)
+```
+
+### Request
+
+```bash
+curl -X POST localhost:8080/score -H 'Content-Type: application/json' -d '{
+  "branch_id": 231, "origin_account_no": "1100430303", "amount": 2000000000,
+  "currency": "NGN", "destination_account_no": "NEW-9999",
+  "customer_location": "road, Kano, x", "origin_country": "NG",
+  "destination_country": "KP", "transaction_id": "T-123"}'
+```
+
+### Response — lean, the same shape as demo stages 6/7
+
+```json
+{
+  "entity_key": "231:1100430303",
+  "transaction_id": "T-123",
+  "decision": "review",
+  "fired_rules": [
+    {"rule": "block_above_hard_cap", "severity": "critical"},
+    {"rule": "detect_unusual_city", "severity": "medium"}
+  ],
+  "judged_against": "own_profile",
+  "latency_ms": 56.24
+}
+```
+
+Only what a caller needs to act: `decision` (`allow`/`review`), the exact `fired_rules`,
+and what it was `judged_against`. Typical latency is tens of milliseconds.
+
+### Webhook (optional) — same decision, pushed to your system
+
+Set `BP_SCORE_WEBHOOK_URL` and every decision is **also** POSTed there, as JSON, in the
+background (never blocks the response). If `BP_SCORE_WEBHOOK_SECRET` is set, each request
+carries an `X-Behaviour-Signature: sha256=…` HMAC header so the receiver can verify it.
+
+```ini
+BP_SCORE_WEBHOOK_URL=https://your-system.example/decisions
+BP_SCORE_WEBHOOK_TIMEOUT=5        # seconds (applies to the background call only)
+BP_SCORE_WEBHOOK_SECRET=…         # optional; enables HMAC-SHA256 signing
+BP_SCORE_RETRAIN_ASYNC=1          # 1 = retrain after responding (fast). 0 = inline (debug)
+```
+
+Leave `BP_SCORE_WEBHOOK_URL` empty and the webhook is simply off — the decision is still
+returned and still audited.
+
+### Audit — two tables
+
+**`bp_decision`** — one row per `/score` call, written *before* responding (never lost):
+the decision, fired rules with severity + details, what it was judged against and why,
+the amount, the latency, and the latest webhook status.
+
+**`bp_webhook_delivery`** — an **append-only** log of every webhook attempt (for
+compliance): the URL, HTTP status, whether it was HMAC-signed, the attempt latency, and
+the timestamp. `bp_decision` holds the *latest* status; this holds *every* attempt.
+
+```bash
+docker exec -it behaviour-profile-db psql -U behaviour -d behaviour -c \
+ "SELECT scored_at, transaction_id, decision, rules_fired_n, latency_ms, webhook_status
+    FROM bp_decision ORDER BY id DESC LIMIT 10;"
+
+docker exec -it behaviour-profile-db psql -U behaviour -d behaviour -c \
+ "SELECT attempted_at, transaction_id, status, http_status, signed, latency_ms
+    FROM bp_webhook_delivery ORDER BY id DESC LIMIT 10;"
+
+# every 'review' in the last day
+# SELECT * FROM bp_decision WHERE decision='review' AND scored_at > now()-interval '1 day';
+```
+
+> **Schema is self-applied.** On startup the service runs `schema_pg.sql` idempotently,
+> so `bp_decision` / `bp_webhook_delivery` (and any future additive table) appear on an
+> existing store without a manual migration.
+
+### Why it's fast — connection pool + rule cache
+
+Two things keep `/score` at single-digit milliseconds (it was ~55–79 ms before):
+
+- **Connection pool** — opening a fresh Postgres connection costs ~30 ms; the pool
+  reuses established ones, so acquiring is microseconds. This was the real bottleneck
+  (the same reason production runs PgBouncer). Sized with `BP_STORE_POOL_MIN/MAX`.
+- **Rule cache** — the rules, blacklist, per-client thresholds and peer baselines (tens
+  of rows, rarely change) are cached **in process** — no Redis, because the data is tiny
+  and identical per replica, so an extra hop to Redis would only add latency. It refreshes
+  every `BP_RULES_CACHE_TTL` seconds; **`POST /reload`** forces it immediately after you
+  load new rules or change a threshold.
+
+The **per-customer profile is never cached** — it is read live on every score, so a
+decision is never made on stale behaviour. Only the rarely-changing rule catalogue is
+cached, which is what protects correctness.
+
+```bash
+curl -X POST localhost:8080/reload   # -> {"reloaded": {"rules": 32, "blacklist": 34, ...}}
 ```

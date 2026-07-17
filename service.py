@@ -20,21 +20,71 @@ Endpoints:
 
 Run:  uvicorn service:app --host 0.0.0.0 --port 8080
 """
+import json
+import os
+import random
+import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 
 import audit
 import config
 import db
 import retrain
-from live_velocity import ProdVelocitySource
+import webhooks
+import live_velocity
+from live_velocity import LocalVelocitySource, ProdVelocitySource
 from rule_engine import RuleEngine, profile_is_trusted
 
 app = FastAPI(title="Adhere Behaviour-Profile Service", version="1.0")
+
+
+# ---------------------------------------------------------------------------
+# DEMO RESPONSE LOG — the database engineer asked to see and reuse the exact JSON
+# that every /demo run returns. Each hit is appended as ONE line (JSON Lines) to a
+# file under config.DEMO_LOG_DIR, which is bind-mounted to ./logs/demo on the host,
+# so the responses survive container restarts and are easy to grep / load. A lock
+# keeps concurrent hits from interleaving their lines.
+# ---------------------------------------------------------------------------
+_demo_log_lock = threading.Lock()
+
+
+def _log_demo_response(entity_key: str, response: dict) -> None:
+    """Append the full /demo JSON response as one line to the demo log. Never raises —
+    logging must never break the demo itself."""
+    try:
+        os.makedirs(config.DEMO_LOG_DIR, exist_ok=True)
+        path = os.path.join(config.DEMO_LOG_DIR, "demo_responses.jsonl")
+        record = {"logged_at": datetime.utcnow().isoformat() + "Z",
+                  "entity_key": entity_key, "response": response}
+        line = json.dumps(record, default=str)
+        with _demo_log_lock, open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        audit.log.info("demo response logged | entity=%s | %s (%d bytes)",
+                       entity_key, path, len(line))
+    except Exception as e:                       # pragma: no cover - logging is best-effort
+        audit.log.warning("demo response log failed: %s", e)
+
+
+@app.on_event("startup")
+def _startup():
+    """Self-migrate: ensure the store schema (incl. bp_decision) exists. Additive,
+    idempotent — reaches an existing volume that the one-time init script missed.
+    Never fatal: if the store is briefly unreachable at boot, /health still comes up."""
+    try:
+        db.ensure_schema()
+        audit.log.info("startup: schema ensured")
+    except Exception as e:
+        audit.log.warning("startup: could not ensure schema (%s) — continuing", e)
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    db.close_pool()
 
 
 @app.middleware("http")
@@ -70,20 +120,18 @@ _COUNTRY_NAMES = {"NG": "Nigeria", "KP": "North Korea", "GB": "United Kingdom",
                   "CN": "China", "RU": "Russia", "AE": "United Arab Emirates"}
 
 
-def _country(code: str | None) -> str:
-    """'KP' -> 'North Korea (KP)'. Unknown codes are shown as-is."""
-    if not code:
-        return "?"
-    name = _COUNTRY_NAMES.get(code.upper())
-    return f"{name} ({code.upper()})" if name else code.upper()
-
-
 class SafeVelocity:
-    """Wrap the live velocity lookup so a production hiccup never breaks scoring.
-    Also honours the BP_ALLOW_PROD_PULL safety switch: when live pulls are disabled,
-    velocity falls back to empty features and never touches production."""
+    """Wrap the velocity lookup so a hiccup never breaks scoring. Prefers the LOCAL
+    recent-window source (bp_recent_txn — real-time, no production read). Falls back to the
+    live production lookup only if LOCAL is off and LIVE + prod-pull are on; otherwise
+    velocity is disabled (empty features)."""
     def __init__(self):
-        self._src = ProdVelocitySource() if (config.LIVE_VELOCITY and config.ALLOW_PROD_PULL) else None
+        if config.LOCAL_VELOCITY:
+            self._src = LocalVelocitySource()
+        elif config.LIVE_VELOCITY and config.ALLOW_PROD_PULL:
+            self._src = ProdVelocitySource()
+        else:
+            self._src = None
 
     def features(self, *a, **k):
         if self._src is None:
@@ -120,67 +168,121 @@ def health():
 
 
 @app.post("/score")
-def score(t: Txn):
-    """The adhere hook. End-to-end, every step logged for accountability:
-    1) look up the customer's profile (or peer group if new/Warming-Up),
-    2) score the transaction against it (rules fire if it breaks their pattern),
-    3) update the customer's event counters,
-    4) retrain the customer iff a trigger is met — and log why / why not / if it failed."""
+def score(t: Txn, background: BackgroundTasks):
+    """The adhere hook — FAST live behaviour scoring.
+
+    Flow (Anita):  transaction -> GET profile from Postgres -> compare behaviour ->
+                   decide risk -> return the decision.
+
+    The HTTP response carries only what a caller needs to act: the decision and the
+    exact rules that fired (the same shape as demo stages 6/7). Everything that does
+    NOT need to block the caller happens AFTER the response is sent (FastAPI background
+    tasks): the webhook delivery and the possible event-driven retrain. The full
+    behavioural analysis is persisted to bp_decision for audit, synchronously, before
+    responding — so nothing is ever lost.
+    """
+    t0 = time.perf_counter()
     txn = t.model_dump()
     txn["ts"] = txn.get("ts") or datetime.utcnow()
     ek = f"{t.branch_id}:{t.origin_account_no}"
 
-    conn = db.connect()
-    try:
-        # 1) which profile is being used?
+    # Pooled connection — acquiring is microseconds (vs ~30ms to open a fresh one),
+    # which is the bulk of what made /score slow. Returned to the pool on exit.
+    with db.pooled() as conn:
+        # 1) GET the profile FOR THIS CURRENCY (one indexed read; also feeds the trust gate).
+        #    Normalized so it matches how the per-currency profile was stored.
+        ccy = config.normalize_currency(txn.get("currency"))
         pc = db.dict_cursor(conn)
         pc.execute("SELECT profile_status, confidence_score, tenure_days, "
                    "lifetime_clean_txns, suspicious_tx_count "
-                   "FROM bp_user_behaviour_profile WHERE entity_key=%s", (ek,))
+                   "FROM bp_user_behaviour_profile WHERE entity_key=%s AND currency=%s", (ek, ccy))
         prof = pc.fetchone()
-        # same gate the engine applies — one helper, so the two can never diverge
-        trusted, trust_reason = profile_is_trusted(prof)
+        trusted, trust_reason = profile_is_trusted(prof)  # one helper shared with the engine
         judged_against = "own_profile" if trusted else ("peer_group" if prof else "peer_group(new)")
 
-        # 2) score
-        eng = RuleEngine(conn, velocity=VELO)
-        fired = eng.evaluate(txn)
+        # 2) COMPARE behaviour + DECIDE risk
+        fired = RuleEngine(conn, velocity=VELO).evaluate(txn)
         decision = "review" if fired else "allow"
         anomaly = any(f["rule_code"] in ANOMALY_RULES and "peer_baseline" not in str(f["details"])
                       for f in fired)
+        # lean rule list for the response + webhook (rule + severity, like stages 6/7)
+        rules_out = [{"rule": f["rule_code"], "severity": f["severity"]} for f in fired]
 
-        # 3) update the customer's counters (only if they have a profile row)
+        # 3) bump the customer's event counters (cheap UPDATE)
         if prof:
             cur = conn.cursor()
             cur.execute(
                 "UPDATE bp_user_behaviour_profile SET txns_since_build = txns_since_build + 1, "
                 "drift_signal_count = CASE WHEN %s THEN drift_signal_count + 1 ELSE 0 END "
-                "WHERE entity_key=%s",
-                (bool(anomaly), ek),   # Postgres CASE/WHEN needs a real boolean, not 1/0
+                "WHERE entity_key=%s AND currency=%s",   # bump only THIS currency's row
+                (bool(anomaly), ek, ccy),   # Postgres CASE/WHEN needs a real boolean, not 1/0
             )
-            conn.commit()
 
+        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+
+        # 4) SAVE the behavioural analysis for audit (synchronous — never lost). When a
+        #    webhook is configured this row is also the OUTBOX marker: webhook_status
+        #    ='pending' is committed WITH the decision, and webhook_next_attempt_at is set
+        #    a grace period out so the fast inline delivery (below) wins the common case
+        #    and the relay only handles what a crash left behind.
+        if config.SCORE_WEBHOOK_URL:
+            webhook_status = "pending"
+            webhook_next = datetime.utcnow() + timedelta(
+                seconds=config.WEBHOOK_RELAY_GRACE_SECONDS)
+        else:
+            webhook_status, webhook_next = "disabled", None
+        dc = conn.cursor()
+        dc.execute(
+            "INSERT INTO bp_decision (entity_key, transaction_id, decision, fired_rules, "
+            "rules_fired_n, judged_against, trust_reason, own_profile_anomaly, amount, "
+            "currency, latency_ms, webhook_status, webhook_next_attempt_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (ek, t.transaction_id, decision,
+             json.dumps([{"rule": f["rule_code"], "severity": f["severity"],
+                          "details": f.get("details")} for f in fired]),
+             len(fired), judged_against, trust_reason, bool(anomaly),
+             t.amount, t.currency, latency_ms, webhook_status, webhook_next),
+        )
+        decision_id = dc.fetchone()[0]
+        # RECORD this transaction into the recent-window store so the NEXT transactions'
+        # velocity/burst rules can see it (real-time, no production read). Written AFTER
+        # scoring (the rules already read the prior window + add the current +1), and
+        # committed together with the decision below.
+        if config.LOCAL_VELOCITY:
+            live_velocity.record_txn(conn, ek, txn["ts"], t.amount, t.destination_account_no,
+                                     t.origin_country, t.destination_country, ccy)
+        # keep the generic accountability trail too
         audit.log_event(ek, "score", decision,
                         {"judged_against": judged_against, "trust_reason": trust_reason,
-                         "own_profile_anomaly": anomaly,
+                         "own_profile_anomaly": anomaly, "latency_ms": latency_ms,
                          "fired": [f["rule_code"] for f in fired]},
                         transaction_id=t.transaction_id, conn=conn)
         conn.commit()
-    finally:
-        conn.close()
 
-    # 4) event-driven retrain (structured: retrained, or skipped-with-reason, or failed)
-    retrained = retrain.maybe_retrain(ek)
-
-    return {
+    # 5) the lean decision — this is the HTTP response
+    result = {
         "entity_key": ek,
-        "decision": decision,
-        "judged_against": judged_against,
-        "trust_reason": trust_reason,   # WHY it was (or was not) judged on its own profile
-        "fired_rules": fired,
-        "own_profile_anomaly": anomaly,
-        "retrain": retrained,      # {retrained:true,...} | {retrained:false,reason:"not due — needs..."}
+        "transaction_id": t.transaction_id,
+        "decision": decision,                 # allow | review
+        "fired_rules": rules_out,             # [{rule, severity}], same as demo stages 6/7
+        "judged_against": judged_against,      # own_profile | peer_group | peer_group(new)
+        "latency_ms": latency_ms,
     }
+
+    # 6) AFTER the response: deliver the webhook and (maybe) retrain — off the hot path,
+    #    so the live decision stays fast.
+    if config.SCORE_WEBHOOK_URL:
+        background.add_task(webhooks.deliver_and_record, decision_id, dict(result))
+    if config.SCORE_RETRAIN_ASYNC:
+        background.add_task(retrain.maybe_retrain, ek)
+    else:
+        retrain.maybe_retrain(ek)
+    # keep the recent-window table bounded without a dedicated job: a small fraction of
+    # scores trigger a background prune (off the hot path, so zero added latency).
+    if config.LOCAL_VELOCITY and random.random() < config.VELOCITY_PRUNE_PROB:
+        background.add_task(live_velocity.prune_recent)
+
+    return result
 
 
 @app.get("/customer/{entity_key}")
@@ -191,8 +293,17 @@ def customer_status(entity_key: str):
     import json
     conn = db.connect()
     cur = db.dict_cursor(conn)
-    cur.execute("SELECT * FROM bp_user_behaviour_profile WHERE entity_key=%s", (entity_key,))
-    p = cur.fetchone()
+    # One row per currency now — the main view shows the DOMINANT currency, with a compact
+    # per-currency breakdown alongside.
+    cur.execute("SELECT * FROM bp_user_behaviour_profile WHERE entity_key=%s "
+                "ORDER BY total_tx_count DESC", (entity_key,))
+    prows = cur.fetchall()
+    p = prows[0] if prows else None
+    currencies = [{"currency": r["currency"], "profile_status": r["profile_status"],
+                   "trusted_by_engine": profile_is_trusted(r)[0],
+                   "learned_from_txn_count": r["total_tx_count"],
+                   "usual_avg_amount": float(r["avg_amount"] or 0),
+                   "biggest_ever": float(r["max_amount"] or 0)} for r in prows]
 
     cur.execute("SELECT event_type, outcome, detail, created_at FROM bp_event_log "
                 "WHERE entity_key=%s ORDER BY created_at DESC LIMIT 10", (entity_key,))
@@ -219,6 +330,7 @@ def customer_status(entity_key: str):
     }
     return {
         "entity_key": entity_key, "has_profile": True,
+        "currency": p["currency"], "currencies": currencies,   # per-currency breakdown
         "customer_name": p["customer_name"], "account_type": p["account_type"],
         "profile_status": p["profile_status"], "confidence_score": p["confidence_score"],
         # the SAME gate the engine applies at decision time (not the stored flag alone)
@@ -244,16 +356,18 @@ def customer_status(entity_key: str):
 def get_profile(entity_key: str):
     conn = db.connect()
     cur = db.dict_cursor(conn)
-    cur.execute("SELECT entity_key, customer_name, profile_status, confidence_score, "
+    cur.execute("SELECT entity_key, currency, customer_name, profile_status, confidence_score, "
                 "drift_status, tenure_days, total_tx_count, txns_since_build, drift_signal_count, "
                 "avg_amount, decayed_avg_amount, max_amount, p95_amount, usual_cities, "
                 "top_day_of_week, profile_version, last_retrained_at "
-                "FROM bp_user_behaviour_profile WHERE entity_key=%s", (entity_key,))
-    row = cur.fetchone()
+                "FROM bp_user_behaviour_profile WHERE entity_key=%s "
+                "ORDER BY total_tx_count DESC", (entity_key,))
+    rows = cur.fetchall()
     conn.close()
-    if not row:
+    if not rows:
         raise HTTPException(404, f"no profile for {entity_key} (new/Warming-Up — judged by peers)")
-    return row
+    # One profile per currency; return them all (dominant first).
+    return {"entity_key": entity_key, "currencies": [r["currency"] for r in rows], "profiles": rows}
 
 
 @app.post("/retrain/{entity_key}")
@@ -269,27 +383,34 @@ def sync_status():
     return sync_manager.status()
 
 
-@app.post("/sync")
-def run_sync(max_rows: int | None = None, chunk_size: int | None = None,
-             full: bool = False):
-    """Pull fresh transactions from production INTO THE LOCAL CACHE — safely.
-
-    This is the only endpoint that touches production, and it does so in bounded
-    chunks (keyset pagination), capped, throttled and statement-timed-out. Every
-    chunk is logged. Everything else in the service reads the cache.
-
-    Query params override the env defaults for one run, e.g.
-    `POST /sync?max_rows=2000` for a small, obviously-light demo pull.
-    """
-    import sync_manager
-    return sync_manager.sync(max_rows=max_rows, chunk_size=chunk_size, full=full)
+# NOTE: POST /sync (a MANUAL, on-demand production pull) is intentionally DISABLED.
+# In production, ingestion is NOT triggered by an HTTP request — it runs as a dedicated
+# scheduled background service (`sync_manager.py --loop`, the `sync` compose service /
+# a k8s CronJob), the only production reader, on BP_SYNC_INTERVAL_SECONDS. Keeping a
+# manual trigger would let anyone pull from production on demand, which does not mirror
+# how the system actually runs. Observe ingestion read-only via GET /sync/status.
+#
+# @app.post("/sync")
+# def run_sync(max_rows: int | None = None, chunk_size: int | None = None,
+#              full: bool = False):
+#     import sync_manager
+#     return sync_manager.sync(max_rows=max_rows, chunk_size=chunk_size, full=full)
 
 
 @app.post("/reload")
 def reload_caches():
-    # RuleEngine caches are per-request in this build, so nothing global to reload;
-    # kept for API compatibility with a pooled/cached production deployment.
-    return {"status": "ok", "note": "rule caches are loaded per request in this build"}
+    """Force an immediate refresh of the in-process reference-data cache (rules,
+    blacklist, per-client thresholds, peer baselines). Call this right after loading
+    new rules or changing thresholds so the change takes effect NOW instead of waiting
+    for the TTL. The per-customer profile is never cached, so nothing else to reload."""
+    from rule_engine import refresh_rule_cache
+    conn = db.connect()
+    try:
+        summary = refresh_rule_cache(conn)
+    finally:
+        conn.close()
+    audit.log.info("reload: rule cache refreshed %s", summary)
+    return {"status": "ok", "reloaded": summary}
 
 
 @app.get("/")
@@ -307,7 +428,7 @@ def examples():
     so you don't have to know any account number in advance."""
     conn = db.connect()
     cur = db.dict_cursor(conn)
-    cols = ("entity_key, branch_id, origin_account_no, customer_name, profile_status, "
+    cols = ("entity_key, currency, branch_id, origin_account_no, customer_name, profile_status, "
             "confidence_score, tenure_days, lifetime_clean_txns, suspicious_tx_count")
     # only customers the engine actually trusts right now (the live §1/§2/§10 gate)
     cur.execute(f"SELECT {cols} FROM bp_user_behaviour_profile "
@@ -346,7 +467,7 @@ def customers(limit: int = 10, trusted: bool | None = None, q: str | None = None
     conn = db.connect()
     cur = db.dict_cursor(conn)
     limit = max(1, min(int(limit), 100))
-    cols = ("entity_key, branch_id, origin_account_no, customer_name, profile_status, "
+    cols = ("entity_key, currency, branch_id, origin_account_no, customer_name, profile_status, "
             "confidence_score, tenure_days, lifetime_clean_txns, suspicious_tx_count, "
             "total_tx_count, avg_amount, max_amount")
     where, params = ["usual_cities <> '{}'"], []
@@ -371,7 +492,7 @@ def customers(limit: int = 10, trusted: bool | None = None, q: str | None = None
     for r in rows:
         ok, why = profile_is_trusted(r)
         out.append({
-            "entity_key": r["entity_key"], "name": r["customer_name"],
+            "entity_key": r["entity_key"], "currency": r["currency"], "name": r["customer_name"],
             "trusted_by_engine": ok, "trust_reason": why,
             "profile_status": r["profile_status"], "confidence": r["confidence_score"],
             "tenure_days": r["tenure_days"], "clean_lifetime_txns": r["lifetime_clean_txns"],
@@ -399,8 +520,15 @@ def stats():
     conn = db.connect()
     cur = db.dict_cursor(conn)
     out = {}
-    cur.execute("SELECT COUNT(*) n FROM bp_user_behaviour_profile")
+    # "profiles" = distinct CUSTOMERS (the profile is now one row per customer PER
+    # CURRENCY, so a raw COUNT(*) would over-count multi-currency customers).
+    cur.execute("SELECT COUNT(DISTINCT entity_key) n FROM bp_user_behaviour_profile")
     out["profiles"] = cur.fetchone()["n"]
+    cur.execute("SELECT COUNT(*) n FROM bp_user_behaviour_profile")
+    out["profile_rows"] = cur.fetchone()["n"]          # rows across all currencies
+    cur.execute("SELECT currency, COUNT(*) n FROM bp_user_behaviour_profile "
+                "GROUP BY currency ORDER BY 2 DESC")
+    out["by_currency"] = {r["currency"]: r["n"] for r in cur.fetchall()}
     cur.execute("SELECT profile_status, COUNT(*) n FROM bp_user_behaviour_profile GROUP BY profile_status")
     out["by_status"] = {r["profile_status"]: r["n"] for r in cur.fetchall()}
     cur.execute("SELECT drift_status, COUNT(*) n FROM bp_user_behaviour_profile GROUP BY drift_status")
@@ -494,64 +622,6 @@ def _why_ordinary(name, r6, amt, vs_median, median, biggest, city_v, their_citie
                   f"see transaction_sent")
 
 
-def _why_abnormal(name, r7, amt, vs_max, biggest, hard_cap, city, hour_label, same_amount,
-                  country="KP") -> str:
-    """Explain the suspicious-context stage HONESTLY.
-
-    The trap: this stage reviews for TWO independent reasons — the amount, and the
-    context (city / country / hour / new beneficiary). If only the context is wrong,
-    saying "100 NGN is 0.0x their biggest-ever" next to "breaks their pattern" implies
-    the amount contributed when no amount rule fired at all. So we check which rules
-    ACTUALLY fired and describe only what really happened.
-
-    `same_amount` = the caller entered one amount, so stage 6 and 7 used the identical
-    figure and ONLY the context differs — which is the whole lesson of the pair.
-    """
-    fired = [f["rule"] for f in r7.get("fired_rules", [])]
-    amount_fired = sorted(set(fired) & AMOUNT_RULES)
-    other_fired = sorted(set(fired) - AMOUNT_RULES)
-    others = (f"{city} is a city they have never used, "
-              + (f"it is cross-border (Nigeria -> {_country(country)}), " if country != "NG"
-                 else "it is domestic, ")
-              + f"the beneficiary is brand-new, and {hour_label} is an hour they have never "
-                f"transacted in")
-    lead = ("the amount is IDENTICAL to stage 6 — only the context changed. "
-            if same_amount else "")
-
-    if not fired:
-        return (f"nothing fired: {amt:,.0f} NGN is not abnormal for {name} (biggest-ever "
-                f"{biggest:,.0f} NGN"
-                + (f", AML hard cap {hard_cap:,.0f}" if hard_cap else "")
-                + "), and nothing in the context broke their pattern either. The engine "
-                  "will not flag a transaction just because a stage is labelled suspicious")
-    if amount_fired and other_fired:
-        return (lead + f"flagged on BOTH counts. The AMOUNT: {amt:,.0f} NGN is "
-                + (f"{vs_max:.1f}x their biggest-ever ({biggest:,.0f} NGN)" if vs_max
-                   else "far above their usual")
-                + (f" and over the AML hard cap ({hard_cap:,.0f})"
-                   if hard_cap and amt > hard_cap else "")
-                + f" -> {', '.join(amount_fired)}. The CONTEXT: {others} -> "
-                  f"{', '.join(other_fired)}. Each rule names exactly which line was crossed")
-    if amount_fired:
-        return (lead + f"flagged on the AMOUNT alone: {amt:,.0f} NGN is "
-                + (f"{vs_max:.1f}x their biggest-ever ({biggest:,.0f} NGN)" if vs_max
-                   else "far above their usual")
-                + (f" and over the AML hard cap ({hard_cap:,.0f})" if hard_cap and amt > hard_cap
-                   else "")
-                + f" -> {', '.join(amount_fired)}")
-    # Reviewed, but NOT because of the amount — say so plainly.
-    return (lead + f"flagged on the CONTEXT, NOT the amount. {amt:,.0f} NGN is "
-            + (f"only {vs_max:.2f}x their biggest-ever ({biggest:,.0f} NGN)" if vs_max
-               else "within their usual range")
-            + ", so no amount rule fired — that same figure passed in stage 6. What changed "
-              f"is where and how it was sent: {others}. Fired: {', '.join(other_fired)}. "
-              f"This is the lesson of the pair: an ordinary amount is still flagged when the "
-              f"surroundings break the customer's pattern"
-            + (f". Raise the amount above their biggest-ever ({biggest:,.0f})" if biggest else "")
-            + (f" or the hard cap ({hard_cap:,.0f})" if hard_cap else "")
-            + " to see the amount rules bite too")
-
-
 def _hard_cap_for(conn, branch_id) -> float | None:
     """Read the AML `block_above_hard_cap` threshold (global rule + any per-branch
     override) from the rules tables — so the demo derives its 'abnormal' amount from
@@ -573,53 +643,66 @@ def _hard_cap_for(conn, branch_id) -> float | None:
 def demo(
     entity_key: str | None = Query(
         None, examples=["231:7064038214"],
-        description="WHO. The customer every stage is run against. Omit to auto-pick a "
-                    "trusted one. Browse keys with GET /customers."),
+        description="WHO to score (branch_id:account_no) — browse keys with GET /customers. "
+                    "If not provided, the demo auto-picks a customer that currently passes "
+                    "the trust gate, so the walkthrough still runs against real learned data."),
     amount: float | None = Query(
         None, examples=[5000],
-        description="HOW MUCH (NGN). Omit -> stage 6 uses their own median spend and "
-                    "stage 7 uses 10x their biggest-ever."),
+        description="HOW MUCH (NGN) — the real transaction amount. It is judged against "
+                    "THIS customer's own median and biggest-ever, so a large multiple fires "
+                    "the amount rules. If not provided, the value is READ FROM THEIR "
+                    "PROFILE (their own median spend, a normal amount for them) — a learned "
+                    "value, never a hard-coded number."),
     city: str | None = Query(
         None, examples=["Pyongyang"],
-        description="WHERE. Judged against the cities THIS customer has actually used "
-                    "(read from their profile). Try one of their own (see "
-                    "GET /customer/{entity_key} -> learned.usual_cities) and no city "
-                    "rule fires; try 'Pyongyang' or 'Kano' and detect_unusual_city "
-                    "fires — because it is not in THEIR list, not because it is on any "
-                    "list of ours."),
+        description="WHERE the transaction happens. Judged against the cities THIS customer "
+                    "has actually used (see GET /customer/{entity_key} -> "
+                    "learned.usual_cities): one of their own fires no city rule; 'Pyongyang' "
+                    "or 'Kano' fires detect_unusual_city — because it is not in THEIR list, "
+                    "not because it is on any list of ours. If not provided, the value is "
+                    "read from their profile (a city they actually use)."),
     destination_country: str | None = Query(
         None, examples=["KP"],
         description="TO WHICH COUNTRY (2-letter ISO code). 'NG' = Nigeria (domestic); "
                     "anything else is cross-border, e.g. 'KP' = North Korea, "
-                    "'GB' = United Kingdom, 'US' = United States. Omit -> stage 6 uses "
-                    "NG (Nigeria), stage 7 uses KP (North Korea)."),
+                    "'GB' = United Kingdom, 'US' = United States — a foreign code fires the "
+                    "cross-border rule. If not provided, it defaults to NG (a normal "
+                    "domestic transfer — the neutral case, not a behavioural value)."),
     hour: int | None = Query(
         None, ge=0, le=23, examples=[3],
         description="WHAT TIME (0-23). Judged against the hours THIS customer actually "
-                    "transacts in. Omit -> stage 6 uses their busiest hour, stage 7 "
-                    "uses an hour they have never used."),
+                    "transacts in — an hour they rarely use fires unusual_time_for_user. If "
+                    "not provided, the value is read from their profile (their busiest "
+                    "hour, normal for them)."),
     destination_account_no: str | None = Query(
         None, examples=["NEW-ACCT-9999"],
-        description="TO WHOM. A beneficiary they already pay fires nothing; an unknown "
-                    "one fires first_time_beneficiary. Omit -> stage 6 uses one of "
-                    "their known beneficiaries, stage 7 uses a brand-new account."),
+        description="TO WHOM. A beneficiary they already pay fires nothing; an unknown one "
+                    "fires first_time_beneficiary. If not provided, the value is read from "
+                    "their profile (a beneficiary they already pay)."),
 ):
     """Run the whole story end-to-end THROUGH the service and return each stage
     with its real result — the microservice version of demo_end_to_end.sh.
 
-    EVERY field is optional. Anything you do not supply is filled in from THAT
-    CUSTOMER'S OWN learned profile (read from Postgres) — never from a fixed script.
+    FEED THE REAL TRANSACTION. Provide the fields of an actual transaction (amount,
+    city, hour, destination country, beneficiary); each is judged against what THIS
+    customer has actually done. Any field you leave out is READ FROM THEIR OWN LEARNED
+    PROFILE (from Postgres) — a real value for that customer, never a fixed/invented one
+    — so the endpoint still runs end-to-end when called with nothing.
 
-    HOW THE TWO SCORING STAGES USE YOUR INPUT
-      * stage 6 - "an ordinary day": fields you omit are taken from their profile
-        (their city, their busiest hour, a beneficiary they already pay, their median).
-      * stage 7 - "a suspicious day": fields you omit are chosen to BREAK their
-        pattern (a city they have never used, cross-border, an hour they never use, a
-        brand-new account).
-      * A field you DO supply is used in BOTH stages, unchanged. So if you pass
-        city=Pyongyang, stage 6 uses Pyongyang too — and the city rule will fire there
-        as well. That is the point: the engine reacts to YOUR input, judged against
-        THEIR learned history.
+    HOW THE SCORING STAGE USES YOUR INPUT
+      * There is ONE scoring stage, and it works exactly like POST /score: a single
+        transaction arrives and the engine either flags it (review) or allows it, based
+        only on the rules it fires against THIS customer's learned profile. There is no
+        pre-labelled "ordinary" or "suspicious" transaction — in production an amount
+        simply comes in and the rules decide.
+      * A field you LEAVE OUT is read from their own profile (their median amount, a city
+        they use, their busiest hour, a beneficiary they already pay; destination country
+        defaults to NG, a normal domestic transfer), so an empty call scores a realistic,
+        in-pattern transaction that normally passes — nothing is hard-coded.
+      * A field you SUPPLY is used as-is and judged against their history. Send an
+        unusual amount, city (e.g. Pyongyang), hour, country (e.g. KP) or a brand-new
+        beneficiary and the matching rule fires — because it breaks THEIR pattern, not
+        because it is on any list of ours.
 
     WHY A CITY IS "UNUSUAL" — there is no blocklist of bad cities. The engine compares
     the city you send against `usual_cities` learned for THIS customer. 'Kano' is
@@ -646,7 +729,7 @@ def demo(
     import json
     import sync_manager
     stages = []
-    TOTAL = 10
+    TOTAL = 9
 
     def add(title, description, result, outcome="", why=""):
         """Record a stage AND narrate it to the logs.
@@ -677,35 +760,29 @@ def demo(
     audit.log.info("demo ================ START (entity_key=%s) ================",
                    entity_key or "auto-pick")
 
-    # 1) SAFE INGESTION — pull fresh data from production without hammering it.
-    #    Deliberately small for the demo: one capped, chunked, throttled run.
-    s1 = sync_manager.sync(max_rows=config.DEMO_SYNC_MAX_ROWS, progress=False)
-    if s1.get("synced"):
-        o1 = (f"pulled {s1.get('new_rows', 0):,} new + {s1.get('refreshed_rows', 0):,} "
-              f"refreshed rows in {s1.get('elapsed_seconds')}s; cache now holds "
-              f"{s1.get('cache_rows_total', 0):,} rows")
-        w1 = (f"production was read READ-ONLY in bounded chunks of "
-              f"{config.SYNC_CHUNK_SIZE:,}, capped at {config.DEMO_SYNC_MAX_ROWS:,} rows for "
-              f"this demo, with a {config.SYNC_SLEEP_SECONDS}s pause between chunks — so the "
-              f"live DB is never hammered")
-    elif s1.get("reason") == "prod_pull_disabled":
-        o1 = "SKIPPED — no production read was attempted"
-        w1 = ("the BP_ALLOW_PROD_PULL safety switch is set to 0, so the service refuses to "
-              "touch production at all. Everything below still works because it reads the "
-              "LOCAL cache. Set BP_ALLOW_PROD_PULL=1 (and have your IP allowlisted) to see "
-              "a real pull")
-    else:
-        o1 = f"FAILED — {s1.get('reason')}"
-        w1 = str(s1.get("error") or s1.get("detail") or "see logs above")
-    add("Pull FRESH data from production — safely",
-        "The ingestion layer (sync_manager) is the ONLY thing that reads production. "
-        "It pages with a keyset cursor (WHERE id > last ORDER BY id LIMIT n) in small "
-        "bounded chunks, caps how much one run may pull, sleeps between chunks, and "
-        "runs READ-ONLY with a server-side statement timeout — so the live DB is never "
-        "hammered. It resumes from a watermark after any failure, and re-pulls the last "
-        "few days so status flips (clean -> blocked) are corrected. Everything after "
-        "this stage reads the LOCAL cache, never production.",
-        s1, outcome=o1, why=w1)
+    # 1) SAFE INGESTION — mirror production: ingestion is a SCHEDULED background job,
+    #    never triggered by a request. So the demo does NOT pull here; it reports the
+    #    state the scheduler maintains (read-only) and explains how it works.
+    s1 = sync_manager.status()
+    _sched = sync_manager.schedule_description()
+    add("Ingestion runs on a SCHEDULE (not on request)",
+        "In production the ONLY thing that reads the live database is a dedicated "
+        f"background service (sync_manager --loop), running {_sched} as its own "
+        "container / k8s CronJob — never triggered by an HTTP call. Each run pages with a "
+        "keyset cursor in small bounded chunks, capped and throttled, READ-ONLY with a "
+        "server-side statement timeout, resumes from a watermark, and re-pulls the last "
+        "few days so status flips (clean -> blocked) are corrected. Everything else — this "
+        "demo included — reads the LOCAL cache the scheduler fills, never production. So no "
+        "user action pulls from the live DB.",
+        s1,
+        outcome=(f"scheduled {_sched} | prod reads allowed: "
+                 f"{config.ALLOW_PROD_PULL} | last sync: {s1.get('last_synced_at') or 'not yet'} "
+                 f"({s1.get('last_status')}) | cache holds {s1.get('cache_rows', 0):,} "
+                 f"transactions for {s1.get('cache_customers', 0):,} customers"),
+        why=("mirroring real production: ingestion is decoupled and automatic. If the sync "
+             "service is paused or down, scoring keeps working from the last synced cache "
+             "— it just gets staler until the scheduler catches up. Watch it with "
+             "`docker compose logs -f sync`"))
 
     # 2) ingestion state — what the cache now holds
     s2 = sync_manager.status()
@@ -783,7 +860,10 @@ def demo(
     picked_by = "auto-picked"
     if entity_key:
         # Caller chose the customer — run the whole demo against THEM, whatever their state.
-        cur.execute("SELECT * FROM bp_user_behaviour_profile WHERE entity_key=%s", (entity_key,))
+        # A customer now has one profile row PER CURRENCY; the demo runs against their
+        # DOMINANT currency (most transactions) and scores in that currency.
+        cur.execute("SELECT * FROM bp_user_behaviour_profile WHERE entity_key=%s "
+                    "ORDER BY total_tx_count DESC LIMIT 1", (entity_key,))
         p = cur.fetchone()
         picked_by = "requested via ?entity_key="
         if p is None:
@@ -891,27 +971,22 @@ def demo(
         return {"decision": "review" if fired else "allow",
                 "fired_rules": [{"rule": f["rule_code"], "severity": f["severity"]} for f in fired]}
 
+    # Score in the customer's OWN (dominant) currency, so every stage judges the
+    # transaction against the matching per-currency profile row we picked above.
     base = {"branch_id": p["branch_id"], "origin_account_no": p["origin_account_no"],
-            "currency": "NGN", "identifier": p["identifier"], "account_type": p["account_type"]}
+            "currency": p.get("currency") or "NGN",
+            "identifier": p["identifier"], "account_type": p["account_type"]}
 
     # Hours come from THIS customer's own learned hour histogram — never hard-coded.
-    # normal_hour  = the hour they transact in most (guaranteed inside their pattern)
-    # odd_hour     = an hour they have NEVER used (falls back to their least-used)
+    # normal_hour = the hour they transact in most (guaranteed inside their pattern). It
+    # fills an omitted `hour` so the demo scores a realistic transaction for them.
     hour_hist = {int(h): int(c) for h, c in json.loads(p["peak_transaction_hours"] or "{}").items()}
     normal_hour = (int(p["top_hour"]) if p["top_hour"] is not None
                    else (max(hour_hist, key=hour_hist.get) if hour_hist else 13))
-    unused_hours = [h for h in range(24) if h not in hour_hist]
-    odd_hour = next((h for h in unused_hours if h in (0, 1, 2, 3, 4, 5)),      # prefer night
-                    unused_hours[0] if unused_hours else
-                    (min(hour_hist, key=hour_hist.get) if hour_hist else 3))
     _h = lambda h: f"{h % 12 or 12}{'am' if h < 12 else 'pm'}"                 # 13 -> '1pm'
 
     their_median = float(p["median_amount"] or p["avg_amount"] or 0)
     amt_supplied = amount is not None
-    # A city they have never used. The candidate pool is only a source of NAMES — what
-    # makes one "unusual" is that it is absent from THIS customer's learned usual_cities.
-    unusual_city = next((c for c in ["Pyongyang", "Kano", "Maiduguri", "Sokoto", "Yola"]
-                         if c not in cities), "Pyongyang")
 
     def _sent(amt, city_v, country_v, hour_v, benef_v, derived: str):
         """Exactly what we sent, where each value came from, and how it compares to what
@@ -958,84 +1033,54 @@ def demo(
             },
         }
 
-    # ---- stage 6: an ORDINARY day. Anything you did not supply comes from THEIR profile.
-    normal_amt = float(amount) if amt_supplied else (their_median or 5000)
-    s6_city = city or their_city
-    s6_country = destination_country or "NG"
-    s6_hour = hour if hour is not None else normal_hour
-    s6_benef = destination_account_no or benef
-    vs_median = (normal_amt / their_median) if their_median else None
-    r6 = score({**base, "amount": normal_amt, "destination_account_no": s6_benef,
-                "customer_location": f"street, {s6_city}, State", "origin_country": "NG",
-                "destination_country": s6_country,
-                "ts": datetime.utcnow().replace(hour=s6_hour)})
+    # ---- The transaction is scored — EXACTLY as POST /score does.
+    # Real production has no curated "ordinary" vs "suspicious" pair: ONE transaction
+    # arrives and the engine either flags it (review) or not (allow), based purely on the
+    # rules it fires against THIS customer's learned profile. That is what this stage
+    # shows — one transaction, one decision + fired rules, just like /score. Fields the
+    # caller omits are filled from the customer's OWN profile so an out-of-the-box call
+    # scores a realistic transaction for them; send an unusual amount / city / hour /
+    # country / beneficiary and the matching rule fires. Nothing is hard-coded.
+    txn_amt = float(amount) if amt_supplied else (their_median or 5000)
+    txn_city = city or their_city
+    txn_country = destination_country or "NG"
+    txn_hour = hour if hour is not None else normal_hour
+    txn_benef = destination_account_no or benef
+    vs_median = (txn_amt / their_median) if their_median else None
+    r_score = score({**base, "amount": txn_amt, "destination_account_no": txn_benef,
+                     "customer_location": f"street, {txn_city}, State", "origin_country": "NG",
+                     "destination_country": txn_country,
+                     "ts": datetime.utcnow().replace(hour=txn_hour)})
     _supplied = [n for n, v in (("amount", amount), ("city", city),
                                 ("destination_country", destination_country),
                                 ("hour", hour), ("destination_account_no", destination_account_no))
                  if v is not None]
-    add("The customer pays — an ORDINARY day",
-        f"{name} sends {normal_amt:,.0f} NGN to {s6_benef} in {s6_city} at {_h(s6_hour)} "
-        f"({s6_country}). "
-        + (f"You supplied: {', '.join(_supplied)}. Everything else is taken from THEIR "
-           f"own profile. " if _supplied else
+    add("The transaction is scored — exactly as POST /score",
+        f"{name} sends {txn_amt:,.0f} NGN to {txn_benef} in {txn_city} at {_h(txn_hour)} "
+        f"({txn_country}). One transaction arrives and the engine returns a decision and the "
+        f"rules it fired — identical to POST /score. It is either flagged (review) or allowed, "
+        f"judged against THIS customer's learned profile; there is no pre-labelled 'ordinary' "
+        f"or 'suspicious' version, because in production an amount simply comes in and the "
+        f"rules decide. "
+        + (f"You supplied: {', '.join(_supplied)}; every other field is taken from THEIR own "
+           f"profile so this is a realistic transaction for them. " if _supplied else
            "You supplied nothing, so every field is taken from THEIR own profile — their "
-           "median spend, a city they use, their busiest hour, a beneficiary they pay. ")
-        + "`transaction_sent` below shows each field, where the value came from, and "
-          "whether it matches what this customer has actually done.",
+           "median spend, a city they use, their busiest hour, a beneficiary they already "
+           "pay. Send an unusual amount, city, hour, country or beneficiary to make the "
+           "matching rule fire. ")
+        + "`transaction_sent` below shows each field, where the value came from, and whether "
+          "it matches what this customer has actually done — the comparison behind the verdict.",
         {"customer": name, "entity_key": ek,
-         "transaction_sent": _sent(normal_amt, s6_city, s6_country, s6_hour, s6_benef,
+         "transaction_sent": _sent(txn_amt, txn_city, txn_country, txn_hour, txn_benef,
                                    derived="from their own profile"),
-         "you_supplied": _supplied or None, **r6},
-        outcome=_rules(r6),
-        why=_why_ordinary(name, r6, normal_amt, vs_median, their_median, biggest,
-                          s6_city, cities, s6_hour, _h(s6_hour), hour_hist,
-                          s6_country, s6_benef, their_benefs, amt_supplied) + city_note)
-
-    # 7) abnormal transaction -> review. All values DERIVED from this customer + the
-    #    AML hard cap — no hard-coded amount. 10x their biggest-ever AND above the cap.
-    # The SAME amount the customer paid in stage 6 — only the CONTEXT changes. A real
-    # customer never says "this one is abnormal"; they pay an amount and the engine
-    # judges the whole transaction. When no amount is given we derive an obviously
-    # extreme one so the out-of-the-box demo also exercises the amount rules.
-    abn_amt = normal_amt if amt_supplied else max(biggest * 10, (hard_cap or 1e9) * 2)
-    abn_vs_max = (abn_amt / biggest) if biggest else None
-    s7_city = city or unusual_city
-    s7_country = destination_country or "KP"
-    s7_hour = hour if hour is not None else odd_hour
-    s7_benef = destination_account_no or "NEW-BENEFICIARY-ACCT"
-    r7 = score({**base, "amount": abn_amt, "destination_account_no": s7_benef,
-                "customer_location": f"road, {s7_city}, region", "origin_country": "NG",
-                "destination_country": s7_country,
-                "ts": datetime.utcnow().replace(hour=s7_hour)})
-    # what actually differs between the two stages — computed, not asserted
-    changed = [n for n, a, b in (("amount", normal_amt, abn_amt), ("city", s6_city, s7_city),
-                                 ("destination_country", s6_country, s7_country),
-                                 ("hour", s6_hour, s7_hour),
-                                 ("destination_account_no", s6_benef, s7_benef)) if a != b]
-    add("The SAME transaction — a SUSPICIOUS day",
-        f"{name} sends {abn_amt:,.0f} NGN to {s7_benef} in {s7_city} at {_h(s7_hour)} "
-        f"({s7_country}). "
-        + (f"Only these changed from stage 6: {', '.join(changed)}. "
-           if changed else "NOTHING changed from stage 6 — you supplied every field, so "
-                           "both stages scored the identical transaction. ")
-        + (f"Fields you supplied ({', '.join(_supplied)}) are used UNCHANGED here too; "
-           f"the rest are chosen to break their pattern. " if _supplied else
-           "You supplied nothing, so every field here is chosen to break their pattern — "
-           "a city they have never used, cross-border, an hour they never use, a new "
-           "account, and an amount 10x their biggest-ever. ")
-        + "`transaction_sent` shows how each value compares to their learned history.",
-        {"customer": name, "entity_key": ek,
-         "transaction_sent": _sent(abn_amt, s7_city, s7_country, s7_hour, s7_benef,
-                                   derived="chosen to break their pattern"),
          "you_supplied": _supplied or None,
-         "changed_from_stage_6": changed or None,
-         "aml_hard_cap_ngn": hard_cap, **r7},
-        outcome=_rules(r7),
-        why=_why_abnormal(name, r7, abn_amt, abn_vs_max, biggest, hard_cap,
-                          s7_city, _h(s7_hour), amt_supplied and "amount" not in changed,
-                          country=s7_country))
+         "aml_hard_cap_ngn": hard_cap, **r_score},
+        outcome=_rules(r_score),
+        why=_why_ordinary(name, r_score, txn_amt, vs_median, their_median, biggest,
+                          txn_city, cities, txn_hour, _h(txn_hour), hour_hist,
+                          txn_country, txn_benef, their_benefs, amt_supplied) + city_note)
 
-    # 8) COLD START — verdict for THIS customer. Every stage is about the customer under
+    # 7) COLD START — verdict for THIS customer. Every stage is about the customer under
     #    test, so this stage answers: "is THIS person a cold start, or have they earned
     #    the right to be judged on their own history?" We never invent another account.
     peer_group = {"branch_id": p["branch_id"], "account_type": p["account_type"] or "unknown"}
@@ -1088,7 +1133,7 @@ def demo(
          "peer_group_they_fall_back_to": peer_group},
         outcome=o8, why=w8)
 
-    # 9) live velocity: a burst the daily profile can't see
+    # 8) live velocity: a burst the daily profile can't see
     r9 = score({**base, "amount": 2_000_000, "destination_account_no": "V6",
                 "customer_location": f"x, {their_city}, y", "origin_country": "NG",
                 "destination_country": "NG", "ts": datetime.utcnow()},
@@ -1103,7 +1148,7 @@ def demo(
              "A profile rebuilt daily could never see a burst that happens inside one "
              "minute, so a live recent-window counter runs alongside the stored profile"))
 
-    # 10) event-driven retrain (force, to show it working)
+    # 9) event-driven retrain (force, to show it working)
     r10 = retrain.retrain_customer(ek)
     if r10.get("retrained"):
         lr = r10.get("learned", {})
@@ -1134,14 +1179,19 @@ def demo(
         r10, outcome=o10, why=w10)
 
     audit.log.info("demo ================ DONE (%s / %s) ================", ek, name)
-    return {
+    response = {
         "customer_used": {"entity_key": ek, "name": name, "picked_by": picked_by,
                           "trusted_by_engine": is_trusted, "trust_reason": trust_why},
         "run_for_another_customer": "GET /demo?entity_key=<key>  — list keys with GET /customers",
         "read_the_logs": "docker compose logs -f  — every stage is narrated with its reason",
         "stages": stages,
         "note": "The whole pipeline through the microservice, all against one real "
-                "customer: a normal transaction passes, an abnormal one (derived from "
-                "their own profile + the AML hard cap) is flagged, new accounts use "
-                "peers, bursts are caught, and the profile retrains itself — no cron.",
+                "customer: the transaction is scored exactly as POST /score (one "
+                "transaction -> decision + fired rules, judged against their learned "
+                "profile), new accounts fall back to peers, live bursts are caught, and "
+                "the profile retrains itself — event-driven, no cron.",
     }
+    # The database engineer asked to see and reuse the exact JSON each /demo run returns:
+    # append it as one line to the demo log (bind-mounted to ./logs/demo on the host).
+    _log_demo_response(ek, response)
+    return response

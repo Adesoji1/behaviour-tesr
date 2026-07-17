@@ -3,7 +3,7 @@
 #       (Debian/Ubuntu: apt-get install -y postgresql-client). It is NOT a pip package.
 fastapi==0.139.0
 uvicorn[standard]==0.51.0
-psycopg[binary]>=3.2,<4   # PostgreSQL driver (v3) — profile store AND production reads
+psycopg[binary,pool]>=3.2,<4  # PostgreSQL driver (v3) + connection pool (fast /score)
 polars==1.42.0            # dataframe engine (also reads/writes Parquet natively)
 pyarrow>=17
 openpyxl>=3.1             # only for load_rules.py (reads AML_Rules.xlsx)
@@ -16,3 +16,7 @@ pymysql>=1.1,<2
 
 # Deliberately NOT here (see ingestionstratimprove.md §10): pandas (polars already
 # covers it), sqlalchemy (we use plain SQL), diskcache/joblib (the cache is Postgres).
+
+# IANA timezone database, so zoneinfo can resolve names like Africa/Lagos for the
+# daily ingestion schedule regardless of the (slim) base image.
+tzdata

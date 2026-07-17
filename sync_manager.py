@@ -41,7 +41,8 @@ Run:
 import argparse
 import sys
 import time
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 
 import psycopg
 from psycopg.rows import dict_row
@@ -85,20 +86,40 @@ class ProdPullDisabled(RuntimeError):
 
 
 def _prod_conn():
-    """A READ-ONLY, timeout-bounded connection to production."""
+    """A connection to production. Read-only + statement timeout are applied PER
+    TRANSACTION with SET LOCAL (see _guarded_txn), never as session-level SETs.
+
+    Why: production sits behind PgBouncer (port 25061) in transaction pooling mode. A
+    session-level `SET default_transaction_read_only` / `SET statement_timeout` would
+    persist on the pooled server connection and leak to the NEXT client — corrupting the
+    pool (exactly what the DB engineer warned against). SET LOCAL is scoped to the
+    current transaction and reset on COMMIT/ROLLBACK, so it is pooler-safe."""
     if not config.ALLOW_PROD_PULL:
         audit.log.warning("prod_pull BLOCKED — BP_ALLOW_PROD_PULL=0; refusing to read "
                           "production (safety switch is ON)")
         raise ProdPullDisabled("production reads are disabled (BP_ALLOW_PROD_PULL=0)")
+    # autocommit=True: statements outside an explicit transaction() block auto-commit;
+    # inside _guarded_txn() we open a real transaction so SET LOCAL takes effect.
     conn = psycopg.connect(config.prod_pg_dsn() + " connect_timeout=30 "
                            "application_name=behaviour-sync", autocommit=True,
                            row_factory=dict_row)
-    with conn.cursor() as c:
-        c.execute("SET default_transaction_read_only = on")   # we can never write prod
-        c.execute(f"SET statement_timeout = {int(config.SYNC_STATEMENT_TIMEOUT_MS)}")
-    audit.log.info("prod_pull connected READ-ONLY host=%s timeout=%sms",
-                   config.PROD_PG["host"], config.SYNC_STATEMENT_TIMEOUT_MS)
+    audit.log.info("prod_pull connected host=%s db=%s (read-only + %sms timeout applied "
+                   "per-transaction via SET LOCAL — pooler-safe)",
+                   config.PROD_PG["host"], config.PROD_PG["dbname"],
+                   config.SYNC_STATEMENT_TIMEOUT_MS)
     return conn
+
+
+@contextmanager
+def _guarded_txn(prod):
+    """Open a transaction on `prod` that is READ-ONLY and statement-timed-out for its
+    duration only (SET LOCAL). Pooler-safe: both settings reset when the block exits."""
+    with prod.transaction():
+        with prod.cursor() as c:
+            # integer from config (cast) — safe to inline; SET takes no bind params
+            c.execute(f"SET LOCAL statement_timeout = {int(config.SYNC_STATEMENT_TIMEOUT_MS)}")
+            c.execute("SET LOCAL transaction_read_only = on")
+        yield
 
 
 def _read_watermark(store) -> dict:
@@ -122,6 +143,20 @@ def _save_watermark(store, last_id: int, added: int, status: str, detail: str = 
         (last_id, added, status, detail[:1000], SOURCE_TABLE),
     )
     store.commit()
+
+
+def _mark_failed(store, detail: str) -> None:
+    """Record a FAILED sync WITHOUT touching last_id — a transient prod outage (e.g. a
+    connection timeout) must never reset the resume point, or the next successful run
+    would re-scan the whole window from id 0. Only status/detail/time change."""
+    try:
+        cur = store.cursor()
+        cur.execute(
+            "UPDATE bp_sync_state SET last_synced_at=now(), last_status='failed', "
+            "last_detail=%s WHERE source=%s", (detail[:1000], SOURCE_TABLE))
+        store.commit()
+    except Exception:
+        pass
 
 
 def _entity_key(row: dict) -> str:
@@ -160,7 +195,8 @@ def _pull_pass(prod, store, where_sql: str, params: tuple, label: str,
                f"WHERE id > %s AND {_BASE_FILTER} AND {where_sql} "
                f"ORDER BY id LIMIT %s")
         t0 = time.perf_counter()
-        with prod.cursor() as pc:
+        # read-only + statement timeout are scoped to THIS transaction (pooler-safe)
+        with _guarded_txn(prod), prod.cursor() as pc:
             pc.execute(sql, (last_id, *params, limit))
             rows = pc.fetchall()
         fetch_ms = (time.perf_counter() - t0) * 1000
@@ -284,15 +320,36 @@ def sync(chunk_size: int | None = None, max_rows: int | None = None,
         audit.log_event("sync", "sync", "completed", out)
         return out
     except Exception as e:
-        try:
-            _save_watermark(store, 0, 0, "failed", str(e))
-        except Exception:
-            pass
+        _mark_failed(store, str(e))          # preserve the watermark on failure
         audit.log.exception("sync FAILED: %s", e)
         audit.log_event("sync", "sync_fail", "failed", {"error": str(e)})
         return {"synced": False, "reason": "error", "error": str(e)}
     finally:
         store.close()
+
+
+def schedule_description() -> str:
+    """One human line describing HOW the scheduler runs — so the log, GET /sync/status
+    and the demo all say the same thing. Daily when BP_SYNC_AT_HOUR is set, else interval."""
+    if config.SYNC_AT_HOUR is not None:
+        return (f"daily at {config.SYNC_AT_HOUR:02d}:{config.SYNC_AT_MINUTE:02d} "
+                f"{config.SYNC_TZ}")
+    return f"every {max(int(config.SYNC_INTERVAL_SECONDS), 30)}s"
+
+
+def _seconds_until_next(hour: int, minute: int, tzname: str) -> float:
+    """Seconds from now until the next occurrence of hour:minute in timezone `tzname`."""
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(tzname)
+    except Exception:                       # bad/missing tz db -> fall back to UTC, logged
+        audit.log.warning("sync: unknown timezone %r, using UTC", tzname)
+        tz = ZoneInfo("UTC")
+    now = datetime.now(tz)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
 
 
 def status() -> dict:
@@ -317,14 +374,85 @@ def status() -> dict:
             "cache_oldest": c["oldest"].isoformat() if c["oldest"] else None,
             "cache_newest": c["newest"].isoformat() if c["newest"] else None,
             "prod_pull_allowed": config.ALLOW_PROD_PULL,
+            "schedule": schedule_description(),
         }
     finally:
         store.close()
 
 
+def _run_one_sync() -> None:
+    """One scheduled ingestion, with the outcome logged. Never raises — the scheduler
+    must survive any single failure and try again at the next scheduled time."""
+    try:
+        out = sync()   # uses the full env-configured caps (not the small demo cap)
+        audit.log.info("sync scheduler run done: %s", {k: out.get(k) for k in
+                       ("synced", "new_rows", "refreshed_rows", "pruned_rows",
+                        "cache_rows_total", "reason")})
+    except Exception as e:                      # never let the loop die
+        audit.log.exception("sync scheduler run FAILED (will retry at next scheduled time): %s", e)
+
+
+def run_forever() -> None:
+    """The PRODUCTION scheduler. This is the ONLY production reader and is NOT triggered
+    by any HTTP request — it runs as its own background service (`python sync_manager.py
+    --loop`, one instance).
+
+    Two modes, chosen by config (see schedule_description()):
+      * DAILY  — when BP_SYNC_AT_HOUR is set: sync once a day at that wall-clock time in
+                 BP_SYNC_TZ (the production default, e.g. 04:00 Africa/Lagos). Equivalent
+                 to a crontab `0 4 * * *`, but self-contained (no host crond).
+      * INTERVAL — otherwise: sync every BP_SYNC_INTERVAL_SECONDS (useful for the initial
+                 backfill and for demos).
+
+    Each run is bounded/throttled (see sync()) and every error is caught so the loop
+    never dies. If BP_ALLOW_PROD_PULL=0 the sync self-skips (logged) and we simply wait
+    for the next time — so ingestion can be paused without stopping the service.
+    """
+    daily = config.SYNC_AT_HOUR is not None
+    audit.log.info("sync scheduler START — %s (run_on_start=%s, cap=%s/run, chunk=%s, "
+                   "throttle=%.2fs). This is the only production reader.",
+                   schedule_description(), config.SYNC_RUN_ON_START,
+                   config.SYNC_MAX_ROWS or "none", config.SYNC_CHUNK_SIZE,
+                   config.SYNC_SLEEP_SECONDS)
+
+    # Webhook OUTBOX relay rides along in this same container (its own thread + cadence),
+    # so a decision whose fast inline delivery was lost (e.g. an API crash) is still
+    # delivered with retries. Decoupled from the sync cadence: it sweeps every few
+    # seconds, not every sync run. Only started when a webhook URL is configured.
+    if config.WEBHOOK_RELAY_ENABLED and config.SCORE_WEBHOOK_URL:
+        import threading
+
+        import webhook_relay
+        threading.Thread(target=webhook_relay.run_forever, name="webhook-relay",
+                         daemon=True).start()
+    elif config.WEBHOOK_RELAY_ENABLED:
+        audit.log.info("webhook relay idle — no BP_SCORE_WEBHOOK_URL configured")
+
+    if config.SYNC_RUN_ON_START:
+        audit.log.info("sync: run_on_start — one catch-up ingestion now")
+        _run_one_sync()
+
+    # After any run_on_start catch-up, both loops SLEEP first, then sync — so the daily
+    # run lands at the scheduled time and the interval run waits a full interval.
+    if daily:
+        while True:
+            secs = _seconds_until_next(config.SYNC_AT_HOUR, config.SYNC_AT_MINUTE, config.SYNC_TZ)
+            audit.log.info("sync: next scheduled ingestion in %.1fh (at %s)",
+                           secs / 3600.0, schedule_description())
+            time.sleep(secs)
+            _run_one_sync()
+    else:
+        interval = max(int(config.SYNC_INTERVAL_SECONDS), 30)
+        while True:
+            time.sleep(interval)
+            _run_one_sync()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Safe incremental sync of production "
                                              "transactions into the local cache.")
+    ap.add_argument("--loop", action="store_true",
+                    help="PRODUCTION scheduler: sync forever every BP_SYNC_INTERVAL_SECONDS")
     ap.add_argument("--full", action="store_true",
                     help="ignore the watermark and re-sync the whole learning window")
     ap.add_argument("--chunk-size", type=int, default=None)
@@ -338,6 +466,10 @@ def main() -> int:
     if a.status:
         import json
         print(json.dumps(status(), indent=2, default=str))
+        return 0
+
+    if a.loop:
+        run_forever()
         return 0
 
     out = sync(chunk_size=a.chunk_size, max_rows=a.max_rows, sleep_s=a.sleep,

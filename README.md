@@ -1,284 +1,322 @@
 # AI Service — Customer Behaviour-Profile & AML Rule Engine
 
-A microservice that **learns each customer's normal behaviour** from their transaction
-history, stores it in PostgreSQL, and scores every new transaction against it — firing
-AML rules when a transaction breaks that customer's pattern. The governance rules come
-from **`Practical rules we can use.pdf`** (in this repo), the constraints this system
-was built to.
+A FastAPI + PostgreSQL microservice that learns each customer's **normal** transaction
+behaviour and scores every new transaction against it, in real time, for AML monitoring.
 
-**No ML model yet** — this stage is the behaviour profile (a feature store) plus the
-rule engine.
-
-## Quick start (Docker)
-
-```bash
-cp .env.example .env          # fill in the DB values; STORE_PG_PASSWORD is required
-docker compose up -d --build  # starts PostgreSQL 17 (the store) + the service
-curl localhost:8080/health    # {"status":"ok",...}
-```
-
-Then open the interactive docs at **<http://localhost:8080/docs>** and try `GET /demo`.
-**Full run/demo/test guide: [`RUNBOOK.md`](RUNBOOK.md).** Integration + DevOps:
-[`SERVICE.md`](SERVICE.md). Plain-language explanation: [`howitworks.md`](howitworks.md).
-
-> The store starts empty. See [`RUNBOOK.md` §4](RUNBOOK.md) for loading the learned
-> profiles.
-
-## ⚠️ Status — what is done vs. what is not yet perfected
-
-**Done and working:** the behaviour profiles, the AML rule engine, the trust/eligibility
-gate (per "Practical rules" §1), the safe chunked ingestion design, and a fully
-composable demo.
-
-**Not yet perfected (planned for later stages):**
-
-1. **Live data pulling is not production-ready.** It is currently **switched off**
-   (`BP_ALLOW_PROD_PULL=0`) and the service runs from a local cache. Two things must be
-   resolved with the DB engineer before enabling it in production:
-   - production sits behind a **connection pool (PgBouncer)**, so our session-level
-     `SET default_transaction_read_only` / `SET statement_timeout` must be replaced with
-     a **read-only role** or transaction-scoped `BEGIN READ ONLY` / `SET LOCAL`;
-   - a **read replica** is the preferred long-term source, and the entity key must be
-     extended to cover **card transactions** (BIN + last-4), not only `origin_account_no`.
-   Design + open questions: [`ingestionstratimprove.md`](ingestionstratimprove.md).
-
-2. **Geo-velocity / "impossible travel" is not implemented.** We currently detect
-   *unusual country* and *multiple countries in a short window*, but **not** true
-   distance-over-time (e.g. Lagos → London in 15 minutes). The IP data exists for ~99% of
-   transactions; what is missing is **geocoding those IPs to coordinates** (a GeoIP
-   database such as MaxMind GeoLite2) plus a haversine speed check, and confirmation that
-   the stored IP is the customer's, not a proxy. Planned for a later stage.
+- **Learns** a per-customer, **per-currency** behaviour profile from their transaction history.
+- **Scores** each incoming transaction against that profile **and** a catalogue of AML rules.
+- **Returns** a decision (`allow` / `review`) plus the exact rules that fired, **sends the
+  result to your system via a webhook**, and **stores it for audit**.
+- **Keeps itself fresh**: ingestion is scheduled, retraining is event-driven per customer,
+  and nothing touches production except one bounded, read-only ingestion job.
 
 ---
 
-## How it works (architecture)
+## 1. The endpoint that matters: `POST /score`
 
-```text
-PROD Postgres (READ ONLY)              PostgreSQL profile store (read/write)
-monitoring_transactionmonitoring       bp_transactions_cache       <- local copy of prod txns (the CACHE)
-       │                               bp_sync_state               <- ingestion watermark (resume point)
-       │  sync_manager.py              bp_user_behaviour_profile   <- ONLINE store (upsert, O(1) lookup)
-       │  THE ONLY PROD READER:        bp_profile_history          <- OFFLINE store (append, timeline)
-       │  keyset-paged · chunked ·     bp_incremental_state        <- EWMA / time-decay accumulators
-       │  capped · throttled ·         bp_peer_baseline            <- non-ML cold-start baseline (new accounts)
-       ▼  resumable · read-only        bp_rule_definition / bp_rule_settings (per-client) / bp_rule_event / bp_blacklist
-  bp_transactions_cache ──build/retrain──▶ profiles
-                                           │   (learning reads the CACHE, never production)
-                                   incoming txn ─▶ rule engine reads profile ─▶ rule fires
+This is the hook your platform calls for every transaction.
+
+```
+transaction JSON ──▶ POST /score
+                        │
+                        ├─ 1. GET the customer's profile (this currency) from PostgreSQL
+                        ├─ 2. COMPARE the transaction to that profile + AML rules
+                        ├─ 3. DECIDE: allow | review  (+ which rules fired)
+                        ├─ 4. RETURN the decision  (fast — the caller waits only for this)
+                        └─ 5. AFTER responding (async, non-blocking):
+                              • deliver the decision to your BP_SCORE_WEBHOOK_URL (the "event")
+                              • save the full analysis to PostgreSQL (audit)
+                              • retrain THIS customer if they are due (event-driven, no cron)
 ```
 
-**One engine end-to-end.** The source is Postgres, so the profile store is Postgres
-too (it was MySQL until the alignment described in `ingestionstratimprove.md` §7).
-**Production has exactly one reader** — the sync job — no matter how many service
-replicas run.
-
-## Which CSV / which data?
-- **Do NOT use** `monitoring_customerbranchprofile_export.csv` — that is a
- pre-computed profile built the wrong way (what we are replacing).
-- **Do NOT reuse** `monitoring_transactionmonitoring_202606240748.csv` — it is a
- stale, partial 600k-row export.
-- **Source of truth** = the `monitoring_transactionmonitoring` table. We pull the
- last **3 months (quarterly, per CTO)** fresh, straight from production, read-only.
-
-## Entity resolution (the key design decision)
-`entity_key = "{branch_id}:{origin_account_no}"`.
-- `origin_account_no` is ~100% populated and **99.4% stable to one customer
- name**; `identifier` is only ~45% populated and full of `N/A` / placeholder
- BVNs, so it is unusable as the key.
-- When `origin_account_no` matches `monitoring_customer.account_numbers[].account_number`
- we can fill `customer_id` to later replicate the profile into
- `monitoring_customerbranchprofile` in production. (enrichment step, optional)
-
-## Governance gate (anti-poisoning — "Practical rules")
-Profiles must **earn trust** before the engine relies on them (config-tunable):
-- **Learn from clean only** — suspicious / blocked / blacklisted txns are excluded from learning.
-- **Eligibility (§1)** — a trusted profile needs tenure ≥ `ELIGIBLE_MIN_TENURE_DAYS` (**90**, full
- lifetime) **and** ≥ `ELIGIBLE_MIN_TXNS` (**100**) clean lifetime txns **and**
- ≤ `ELIGIBLE_MAX_FRAUD_TXNS` (**0**) confirmed-fraud txns; otherwise `warming_up`.
- This is §1 verbatim: *"≥90 days history, ≥100 transactions, No confirmed fraud cases"*.
- (§2's table sanctions 50–500 txns; 100 satisfies **both** §1 and §2, so it is the default.)
-- **The gate is enforced at DECISION time, not just at build time** (`profile_is_trusted()`
- in `rule_engine.py`). `profile_status` is decided when a profile is *built*, so a profile
- built under an older/looser policy would keep a stale `active` flag until it happened to be
- rebuilt. Re-checking the gate on every score means a policy change — or newly-seen fraud —
- takes effect **immediately** and fails safe. `/score` and `/customer` return a
- `trust_reason` explaining exactly why a profile was or wasn't trusted.
-- **Tenure is a LIFETIME property, but a retrain only sees the learning window.** The
- batch build gets true lifetime tenure from `extract_tenure.py`. An event-driven retrain
- **carries it forward** from the stored profile (`tenure_days + days elapsed`), which is
- arithmetically exact and needs no production query. With **no prior profile** it falls
- back to what the cache can prove, which *under-states* tenure — deliberately: an
- unproven account stays `warming_up` and is judged against peers, which fails safe and
- matches the PDF's "Otherwise: Profile Status = Warming Up".
-- **Confidence** (`confidence_score` 0–100 = history + consistency + completeness); trusted at ≥ `CONFIDENCE_TRUST_THRESHOLD` (60).
-- The rule engine judges an account against its **own** profile only when Active **and** confident; otherwise it uses the **peer baseline**. This is what stops a fraudster establishing a fake "normal".
-- Time-decay half-life = 90 days (weights ≈ 1.0 / 0.8 / 0.5 / 0.2 at 0 / 30 / 90 / 180 days).
-
-## What each script does
-
-| File | Purpose |
-|------|---------|
-| `config.py` | All connection settings + pipeline params (env-overridable). Prod is forced read-only. |
-| `schema_pg.sql` | The `bp_` **PostgreSQL** tables (feature store + rules + per-client settings + peer baseline + lineage + transactions cache + sync watermark). Applied automatically by the `db` container. (`schema.sql` is the superseded MySQL version, kept for reference.) |
-| `db.py` | Profile-store access layer: connection, dict cursors, `ON CONFLICT` upsert builder, per-customer **advisory locks**. One place owns the SQL dialect. |
-| `sync_manager.py` | **The Data Synchronization Layer — the ONLY process that reads production.** Keyset-paged, chunked, row-capped, throttled, statement-timed-out, resumable. Fills `bp_transactions_cache`. |
-| `migrate_mysql_to_pg.py` | One-time copy of the already-learned profiles from the old MySQL store into PostgreSQL (store-to-store; production untouched). |
-| `extract_tenure.py` | READ-ONLY: each account's **full-lifetime** age + clean-txn counts → `data/tenure.csv` (for the eligibility gate). |
-| `extract_transactions.py` | READ-ONLY `psql \copy` of the last 3 months (quarterly) → `data/transactions.csv`. |
-| `build_profiles.py` | **polars** builder: clean-baseline filter, sliding windows, time-decay/EWMA, entropy, **eligibility gate (Active/Warming-Up) + confidence**, peer baselines → upserts PostgreSQL. |
-| `load_rules.py` | Loads the 32 AML rules + mirrors `users_blacklist` (read-only). |
-| `client_thresholds.py` | Set/override rule thresholds **per client** (per institution) or switch a rule off — tier-1/2/3 differ. |
-| `rollback.py` | §12 revert a profile (or a whole build run) to an earlier version from `bp_profile_history`. |
-| `live_velocity.py` | The "live feature factory": recent-window (1m/10m/15m/1h/24h) look-up for velocity rules. CSV source (demo) + prod-SQL source (real). |
-| `rule_engine.py` | Reads a stored profile + client thresholds (+ optional live velocity), fires rules on an incoming txn, logs to `bp_rule_event`. |
-| `retrain.py` | **Event-driven per-customer retrain** — recompute one customer **from the local cache** (production is never touched) when a trigger is met; per-customer locked. |
-| `service.py` | **FastAPI microservice** the adhere app calls per transaction (`/score`, `/profile`, `/retrain`). See `SERVICE.md`. |
-| `Dockerfile` / `requirements.txt` | Package + run the microservice. |
-| `demo_end_to_end.sh` + `demo_helpers.py` | Narrated, timestamped end-to-end demo → `logs/demo_*.log`. |
-
-## Run it end-to-end
-```bash
-source ../.venv/bin/activate
-
-# 1. create schema (idempotent)
-# (nothing to do: the db container applies schema_pg.sql automatically on first start)
-docker compose up -d db
-
-# 2a. lifetime tenure for the eligibility gate (READ ONLY from prod)
-python extract_tenure.py                             # -> data/tenure.csv
-
-# 2b. extract fresh quarterly (3-month) dataset (READ ONLY from prod)
-python extract_transactions.py                       # full pull -> data/transactions.csv
-# or a quick slice:  python extract_transactions.py --branch 231 --sample-limit 150000 --out data/transactions_sample.csv
-
-# 3. learn + save profiles (clean-baseline filter + Active/Warming-Up gate + confidence)
-python build_profiles.py --in data/transactions.csv
-
-# 4. load rules + blacklist
-python load_rules.py
-
-# 5. (optional) a client sets its own thresholds — tier-1/2/3 differ
-python client_thresholds.py --branch 231 --rule block_above_hard_cap --set hard_cap=250000000
-python client_thresholds.py --branch 231 --rule detect_unusual_city --disable
-
-# 6. see rules fire off the learned profiles (uses each client's thresholds)
-python rule_engine.py --demo --log
-```
-
-## Self-updating: event-driven per-customer retraining (NO cron)
-Per CTO, there is **no nightly cron**. The batch build (`build_profiles.py`) seeds all
-profiles **once**; after that each customer is refreshed **event-driven** by the
-microservice when their own activity meets a trigger — **≥100 new txns OR 30 days OR
-sustained drift**. Retraining is per-customer, concurrent-safe (per-customer DB lock),
-and rides on the transaction the app already sends. See **`SERVICE.md`**, `retrain.py`,
-`service.py`. `bp_incremental_state` holds the EWMA/time-decay state
-(half-life = `BP_DECAY_HALF_LIFE`, default 90 days).
-
-## Demo for a CTO / client
+**Request**
 
 ```bash
-./demo_end_to_end.sh                 # fast: narrates every stage using built profiles
-BUILD_SLICE=1 ./demo_end_to_end.sh   # also learns a fresh small slice live
+curl -X POST http://localhost:8080/score -H 'Content-Type: application/json' -d '{
+  "branch_id": 231, "origin_account_no": "5510027677",
+  "amount": 8000, "currency": "NGN",
+  "destination_account_no": "0123965972",
+  "customer_location": "street, Lagos, State",
+  "origin_country": "NG", "destination_country": "NG",
+  "transaction_id": "TXN-123", "ts": "2026-07-17T14:00:00"
+}'
 ```
 
-Writes a timestamped transcript to `logs/demo_*.log`: config → read-only source →
-(build) → what a real customer looks like → load rules → a client setting its own
-thresholds → rules firing (normal passes / abnormal flagged) → live velocity burst →
-cold-start peer baseline → the nightly scheduler.
+**Response** (this is also what is delivered to the webhook)
 
-## Not built yet (by design, per scope)
-
-- ML inference (XGBoost / IsolationForest) — profiles are the feature vectors it will consume.
-- Behavioural embeddings / peer-group clustering (needs the ML stage).
-
-## Exact fetch SQL (if you prefer a manual export over the extractor)
-```sql
-SELECT id, transaction_id, amount, currency, transaction_type,
-      transaction_type_normalized, status, branch_id, origin_account_no,
-      origin_account_type, destination_account_no, destination_bank_code,
-      customer_name, customer_email, identifier, identifier_type_id, bvn,
-      account_type, host(customer_ip_address) AS customer_ip_address,
-      customer_location, merchant_name, merchant_location,
-      origin_country, destination_country, date_created,
-      sender_blacklisted, receiver_blacklisted, is_blocked, indicator
-FROM   monitoring_transactionmonitoring
-WHERE  date_created >= now() - interval '3 months'   -- quarterly window (per CTO)
- AND  origin_account_no IS NOT NULL
- AND  origin_account_no NOT IN ('N/A','')
-ORDER  BY branch_id, origin_account_no, date_created;
-```
-⚠️ The "blind spot" (replication lag on rapid txns) — acknowledged, and mostly avoided by design. That risk only bites if you read a replica that lags the primary. Our hybrid reads the primary at scoring time for the recent-window velocity, so a burst is visible immediately. The residual risk is only if you later scale reads onto a replica — then you'd add a short read-your-writes window or a Redis counter. I've documented this honestly rather than pretending it's fully solved, because without a streaming platform it's inherent.
-
-MAX_SANE_AMOUNT (default ₦10 trillion)
-This is a data-quality guard against garbage amounts. Production contains a handful of transactions with impossible values — the worst we found was ₦300 quadrillion (bigger than Nigeria's entire GDP), clearly test/entry errors. Any transaction above this cap is treated as bad data and excluded from learning, so one garbage row can't wreck a customer's "biggest ever" (max_amount), their averages, or the peer baseline. Without it, a single ₦300-quadrillion row would make the "exceeds historical maximum" rule useless for that account and inflate the peer group. It's in config.py and applied in the builder's impossible-amount guard. ₦10 trillion is far above any real transaction, so nothing legitimate is ever dropped.
-
-STORE_HISTORY_JSON (default OFF)
-This controls how much detail the offline history log keeps per nightly run. We always keep a compact timeline (counts, amounts, confidence) per profile per run. When this is ON, we also store a full JSON snapshot of every profile every night — great for point-in-time analysis and future ML retraining, but heavy: ~2 KB × 100k profiles × every night. On this small Aiven test DB that filled the disk and flipped it read-only, so we default it OFF (the current profile always holds full detail anyway). In production, where storage is ample, you'd turn it ON (BP_STORE_HISTORY_JSON=1) to keep full historical snapshots. It's the reason bp_profile_history.profile_json is nullable.
-
-Both are env-overridable, so nothing is hard-coded. Standing by for the build to finish, then I'll run the demo to confirm it's all clean.
-
-## Configuration
-
-Every setting is an environment variable — compliance can retune the system by editing
-`.env` and restarting. **No code change, no redeploy.** All 42 variables are documented
-in plain language at the top of `config.py`, grouped by what a reader actually wants:
-where the data comes from, where we save it, how we learn a customer's normal, who is
-trusted, when a customer is re-learned, how we protect the live database, storage, and
-legacy.
-
-Each entry explains **what the number means**, not just the name:
-
-```text
-BP_DECAY_HALF_LIFE          90 = a transaction from 90 days ago counts HALF as much as
-                            one from today. Lower = forget faster.
-BP_SYNC_SLEEP_SECONDS       0.2 = wait 0.2s before asking production again. RAISE THIS
-                            to be gentler on the live DB.
-BP_DRIFT_SIGNAL_THRESHOLD   5 anomalies IN A ROW. One normal transaction resets the
-                            count, so a single odd payment never triggers a retrain.
+```json
+{
+  "entity_key": "231:5510027677",
+  "transaction_id": "TXN-123",
+  "decision": "allow",
+  "fired_rules": [],
+  "judged_against": "own_profile",
+  "latency_ms": 8.4
+}
 ```
 
-## Known finding: `BP_CONFIDENCE_TRUST` is near-inert at 60
+`judged_against` is `own_profile` when the customer is trusted, or `peer_group` /
+`peer_group(new)` when they are not yet trusted (judged against peers — anti-poisoning).
 
-Measured against the real 99,254 profiles, the confidence threshold **denies only 1 of
-the 6,653 profiles** that pass the other §1 conditions. It is not doing the work one
-might assume.
+> The webhook (the "event") is delivered **after** the HTTP response, so it never slows the
+> caller down. Delivery is **guaranteed** (retried) by the outbox relay — see §6.
 
-**Why.** `BP_MIN_TENURE_DAYS` (90) and `BP_MIN_TXNS` (100) already force the *history*
-component to 1.0, which banks **50 of the 100 points automatically**. To score under 60
-a customer would have to be wildly erratic *and* missing most data dimensions —
-effectively nobody. Among profiles that pass §1 the minimum confidence is 59 and the
-median is 76.
+---
 
-**It is still worth keeping.** It is a cheap backstop: if the tenure/transaction gates
-are ever lowered, history stops being pinned at 1.0 and confidence immediately starts
-doing real work.
+## 2. Run it in Docker
 
-### Raising it to 75 would be a mistake (evidence)
+```bash
+cp .env.example .env          # then fill in the secrets (see §4)
+docker compose up -d --build  # starts 3 services
+curl localhost:8080/health    # -> {"status":"ok",...}
+open http://localhost:8080/docs   # interactive API docs
+```
 
-Raising the threshold to 75 would move ~1,030 customers from own-profile to peer
-judgement. Who they are matters:
+Three services start:
 
-| Group | Customers | Avg clean txns | Variability (cv) |
-| --- | --- | --- | --- |
-| **Would be demoted** (confidence 60–74) | 1,003 individual · **25 corporate** · 3 agency | 324 — *corporate: 10,385* | 2.73 – 3.40 |
-| **Would keep trust** (confidence ≥ 75) | 3,081 individual · 13 corporate · 22 agency | 260 — *corporate: 568* | 1.60 – 1.68 |
+| Service             | Container                | Role |
+|---------------------|--------------------------|------|
+| `behaviour-profile` | `adhere-behaviour`       | The API (`POST /score`, `/demo`, …). Scale with `BP_WORKERS`. |
+| `db`                | `behaviour-profile-db`   | The **profile store** (PostgreSQL). Holds all learned behaviour in a named volume. |
+| `sync`              | `adhere-behaviour-sync`  | The **only** process that reads production. Scheduled ingestion + webhook relay. |
 
-Two things stand out:
+### ⛔ NEVER run `docker compose down -v`
 
-1. **The demoted group has _more_ history, not less** (324 vs 260 average clean
-   transactions). The only real difference between the groups is **variability**.
-2. **It is backwards for corporates.** 25 corporates averaging **10,385 transactions**
-   would be demoted, while 13 corporates averaging 568 keep their trusted profile —
-   discarding the richest profiles in the system.
+The `-v` flag **deletes the `behaviour_pgdata17` volume — every learned profile is lost.**
+Use `docker compose down` (no `-v`) to stop; the volume (and all learned behaviour)
+survives restarts and redeploys. See §7 for how to back it up.
 
-The cause is that the confidence formula's *consistency* term penalises variable
-spending — but **variability is legitimate for a business**. Lumpy invoices are a
-corporate's normal. Demoting them means judging a 10,000-transaction business against
-the average of a peer group of ~13–38 accounts, which would produce **more** false
-positives, not fewer — alert fatigue on exactly the best-understood customers.
+---
 
-**Recommendation:** leave `BP_CONFIDENCE_TRUST` at 60. The issue is not the threshold
-but the formula, which conflates *"variable"* with *"unknowable"*. If confidence should
-be load-bearing, fix the **formula** (e.g. do not penalise variability for corporates,
-or score consistency relative to the customer's own peer group) rather than raising the
-dial. That is an analysis to do with compliance, not a config flip.
+## 3. What happens automatically in a deployment
+
+All four are on by default and env-driven:
+
+| Behaviour | Runs where | Controlled by | What it does |
+|---|---|---|---|
+| **Scheduled ingestion** | `sync` service | `BP_SYNC_AT_HOUR` (daily) or `BP_SYNC_INTERVAL_SECONDS` | Pulls fresh prod transactions → local cache (`bp_transactions_cache`). Bounded, throttled, read-only, resumable. The **only** production reader. |
+| **Event-driven retraining** | inside `/score` | `BP_RETRAIN_*` thresholds | Rebuilds **that one** customer's profile when they cross a trigger (≥N new txns / ≥D days / sustained drift). **No cron.** |
+| **Webhook outbox relay** | `sync` service | `BP_WEBHOOK_*` | Redelivers any decision whose inline webhook was lost (e.g. an API crash), with exponential backoff, until `sent` or `dead`. |
+| **Local velocity / burst detection** | inside `/score` | `BP_LOCAL_VELOCITY` | Records each scored transaction locally and computes 1m/10m/1h burst features — real-time, no production read. |
+
+---
+
+## 4. Environment variables
+
+Everything is env-driven. Copy `.env.example` → `.env` and set the values below.
+**`.env` is git-ignored and must never be committed** (it holds live credentials).
+
+### 4a. Secrets — required (never commit)
+
+| Variable | What |
+|---|---|
+| `STORE_PG_PASSWORD` | Password for the profile-store PostgreSQL (compose refuses to start without it). |
+| `PROD_PG_HOST` / `PROD_PG_PORT` / `PROD_PG_USER` / `PROD_PG_PASSWORD` / `PROD_PG_DB` | Read-only connection to the **production** transaction DB (for ingestion). |
+| `PGSSLMODE` | `require` for the production connection. |
+| `BP_SCORE_WEBHOOK_SECRET` | Optional HMAC secret; when set, each webhook carries an `X-Behaviour-Signature` header so your consumer can verify it came from us. |
+
+In Docker, the store host/port are injected by compose (`STORE_PG_HOST=db`, `STORE_PG_PORT=5432`).
+
+### 4b. Turn these ON for **production**
+
+```ini
+# --- Production ingestion: once a day, off-peak ---
+BP_ALLOW_PROD_PULL=1                # master switch: allow the sync job to read production
+BP_SYNC_AT_HOUR=4                   # daily ingestion at 04:00 (comment out = interval mode)
+BP_SYNC_AT_MINUTE=0
+BP_SYNC_TZ=UTC                      # container TZ is UTC; schedule is unambiguous
+BP_SYNC_RUN_ON_START=1             # one catch-up pull on deploy, then follow the schedule
+BP_SYNC_MAX_ROWS=0                  # 0 = no per-run cap (a daily off-peak run should not be capped)
+
+# --- Send every decision to your system (the "event") ---
+BP_SCORE_WEBHOOK_URL=https://your-consumer.example.com/aml/events   # your real endpoint
+BP_SCORE_WEBHOOK_SECRET=<a-strong-shared-secret>
+
+# --- Real-time burst detection (recommended, zero production load) ---
+BP_LOCAL_VELOCITY=1
+BP_LIVE_VELOCITY=0                  # do NOT use the per-score production velocity query (slow)
+
+# --- Throughput: scale to your peak concurrency ---
+BP_WORKERS=4                        # API worker processes
+BP_STORE_POOL_MAX=12                # DB connections per worker
+```
+
+### 4c. Use these for the **first-time local backfill** (seeding)
+
+Before production’s daily schedule can maintain the data, you must fill the cache once and
+build the initial profiles. Run in **interval mode** (fast, repeated pulls) until caught up:
+
+```ini
+# BP_SYNC_AT_HOUR=                  # LEAVE UNSET/commented -> interval mode (drives the backfill)
+BP_SYNC_INTERVAL_SECONDS=120        # pull every 2 min
+BP_SYNC_MAX_ROWS=20000              # cap per run while backfilling
+BP_SYNC_CHUNK_SIZE=2000
+BP_SYNC_SLEEP_SECONDS=0.25          # throttle between chunks (gentle on prod)
+BP_ALLOW_PROD_PULL=1
+```
+
+Then seed the profiles **once** (see §5), and switch to the production schedule (§4b).
+
+### 4d. Other useful knobs (sensible defaults; see `config.py` for the full list)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BP_LOOKBACK_MONTHS` | 3 | Learning window (quarterly, per CTO). |
+| `BP_RETRAIN_MIN_NEW_TXNS` / `BP_RETRAIN_MAX_AGE_DAYS` / `BP_DRIFT_SIGNAL_THRESHOLD` | 100 / 30 / 5 | Event-driven retrain triggers (OR-ed). |
+| `BP_ELIGIBLE_MIN_TENURE_DAYS` / `BP_ELIGIBLE_MIN_TXNS` / `BP_ELIGIBLE_MAX_FRAUD_TXNS` | 90 / 100 / 0 | §1 trust gate (who is judged on their own profile vs peers). |
+| `BP_WEBHOOK_MAX_ATTEMPTS` / `BP_WEBHOOK_BACKOFF_BASE_SECONDS` / `BP_WEBHOOK_RELAY_INTERVAL_SECONDS` | 8 / 5 / 5 | Webhook outbox retry policy. |
+| `BP_VELOCITY_RETAIN_HOURS` | 48 | How long recent transactions are kept for burst detection. |
+| `BP_DEFAULT_CURRENCY` | NGN | Currency assumed when a transaction has none. |
+| `BP_DEMO_LOG_DIR` | `/app/logs/demo` | Where `GET /demo` responses are logged. |
+
+---
+
+## 5. First-time seeding (backfill → build profiles)
+
+Do this once, on first deploy, while in **interval mode** (§4c):
+
+```bash
+# 1. Let the sync service run until the cache stops growing (backfill complete).
+docker compose exec behaviour-profile python -c "import sync_manager,json;print(json.dumps(sync_manager.status(),default=str))"
+
+# 2. Build the initial per-currency profiles from the cache (one-time).
+docker compose exec behaviour-profile python retrain.py --rebuild-all
+
+# 3. Switch .env to the production daily schedule (§4b) and redeploy the sync service.
+```
+
+After this, retraining is **event-driven per customer** — you never run `--rebuild-all` again.
+
+---
+
+## 6. Guaranteed webhook delivery (the outbox)
+
+Every `/score` writes the decision **and** a `webhook_status='pending'` marker in the **same
+database transaction**, then delivers the webhook inline. If that inline attempt is lost
+(e.g. the API crashes), the **relay** in the `sync` service redelivers it with exponential
+backoff until it succeeds (`sent`) or exhausts the retry budget (`dead`). No decision's
+delivery is ever lost, and it needs **no extra infrastructure** (no Redis/queue).
+
+- **Monitor** the dead-letter queue: rows in `bp_decision` with `webhook_status='dead'`.
+- Every attempt is recorded in `bp_webhook_delivery` for audit.
+
+---
+
+## 7. Carry learned behaviour to production (`pg_dump` sync)
+
+Production starts with an **empty** profile store. Two options:
+
+**A. Rebuild in production** — let it build itself (backfill → `retrain.py --rebuild-all`, §5).
+
+**B. Carry the profiles over** (no re-learning) — the profiles were learned from real
+production data, so they are valid in production. Use **`pg_migrate_store.sh`**:
+
+```bash
+# on the source (this) environment — writes a data-only dump to ./migrate_dumps/
+./pg_migrate_store.sh dump
+
+# into the production store (its schema is created automatically on first API start)
+DEST_PG_HOST=<prod-db-host> DEST_PG_PORT=5432 DEST_PG_USER=<user> \
+DEST_PG_PASSWORD=<pw> DEST_PG_DB=<db> DEST_PG_SSLMODE=require \
+  ./pg_migrate_store.sh restore ./migrate_dumps/store_<timestamp>.dump --yes
+
+# verify
+DEST_PG_*=... ./pg_migrate_store.sh verify --dest
+```
+
+It carries the learned tables (profiles, peer baselines, rules, watermark). **Dumps contain
+customer-derived data and are git-ignored** (`migrate_dumps/`).
+
+> For production durability, run the profile store on a **managed PostgreSQL** (with
+> backups / point-in-time recovery) and point `STORE_PG_*` at it — then learned behaviour is
+> backed up and inherited by every deploy automatically.
+
+---
+
+## 8. Logs & auditing — where everything is
+
+**PostgreSQL audit tables** (queryable, the system of record):
+
+| Table | What it records |
+|---|---|
+| `bp_decision` | Every `/score` decision: the transaction, verdict, fired rules, latency, webhook status. |
+| `bp_webhook_delivery` | Every webhook delivery **attempt** (append-only) — proves when/how each decision was sent. |
+| `bp_event_log` | Per-customer accountability trail (scored, retrained, skipped-with-reason, failures). |
+| `bp_profile_history` | A snapshot each time a profile is (re)built. |
+
+**Files** (under `./logs/`, bind-mounted to the host, git-ignored):
+
+| Path | What |
+|---|---|
+| `logs/demo/demo_responses.jsonl` | The full JSON of every `GET /demo` run (for the DB engineer). |
+| `logs/loadtest/` | Load-test results (CSV, HTML, `summary.json`). |
+| `docker compose logs -f behaviour-profile` \| `sync` | Live structured stdout (every stage narrated with its reason). |
+
+---
+
+## 9. Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /score` | **The hook.** Score a transaction → decision + fired rules; webhook + audit + maybe retrain. |
+| `GET /demo` | End-to-end walkthrough for one customer, every stage narrated. Logged to `logs/demo/`. |
+| `GET /customer/{entity_key}` | Everything about a customer: identity, eligibility, what was learned (per currency), retrain state. |
+| `GET /profile/{entity_key}` | The raw learned profile row(s) — one per currency. |
+| `GET /customers` / `GET /examples` | Browse real customers / copy-paste sample keys. |
+| `GET /stats` | Totals: customers, per-currency counts, Active vs Warming-Up, rules, peer baselines. |
+| `GET /sync/status` | Ingestion state: schedule, watermark, cache size (read-only). |
+| `POST /retrain/{entity_key}` | Force a rebuild of one customer now (from the cache). |
+| `POST /reload` | Refresh the in-process rule/blacklist/peer cache. |
+| `GET /health` | Liveness. |
+
+> `POST /sync` (a manual, on-demand production pull) is **intentionally disabled** — nothing
+> can pull from production on request; ingestion is only the scheduled `sync` service.
+
+---
+
+## 10. How it works (architecture)
+
+Three distinct layers — never confuse them:
+
+```
+PRODUCTION (read-only)          PROFILE STORE (PostgreSQL, the named volume)
+transaction DB                  ┌─ bp_transactions_cache      ← CACHE: raw prod txns (filled by `sync`)
+      │  scheduled              ├─ bp_user_behaviour_profile  ← PROFILE: learned normal, PER CURRENCY
+      │  ingestion only ───────▶├─ bp_peer_baseline           ← cold-start baseline (per branch/type/currency)
+                                ├─ bp_recent_txn              ← recent window for live burst detection
+                                ├─ bp_decision / _webhook_delivery / _event_log  ← audit
+                                └─ bp_rule_definition / _settings / _blacklist   ← AML rules
+POST /score reads the PROFILE (never production, never the raw cache) → fast decision.
+```
+
+- **Multi-currency:** a customer has one profile **per currency**; a transaction is scored
+  against the profile and peer baseline **for its currency**, so NGN and USD never blend.
+  Adding a new currency (e.g. a `£10,000` escalation rule) is **data only** — no code change.
+- **Governance gate (anti-poisoning):** a customer is judged on their **own** profile only
+  once they pass the §1 eligibility gate (tenure + clean-txn count + no confirmed fraud +
+  confidence). Otherwise they are judged against their **peer group** — so a fraudster can't
+  establish a "trusted" baseline from a little fake activity.
+
+---
+
+## 11. Load testing (optional)
+
+Locust against `POST /score`, opt-in via the `loadtest` compose profile:
+
+```bash
+LOCUST_USERS=20 LOCUST_RUN_TIME=60s docker compose --profile loadtest run --rm loadtest
+# results in ./logs/loadtest/  (CSV, HTML, summary.json)
+```
+
+Knobs: `LOCUST_USERS`, `LOCUST_SPAWN_RATE`, `LOCUST_RUN_TIME`, `SCORE_SLA_MS` (default 600ms),
+`SCORE_LOAD_ENTITY_KEYS`, `SCORE_ABNORMAL_PCT`.
+
+---
+
+## 12. Not yet perfected (planned)
+
+- **Read replica** as the ingestion source (shields the production primary entirely) and
+  **card transactions** in the entity key (BIN + last-4).
+- **Geo-velocity / impossible-travel** (GeoIP + haversine speed check).
+- **Per-currency thresholds** for the two remaining absolute NGN rules (`block_above_hard_cap`,
+  `high_outbound_amount_15m`); the escalation rules are already per-currency.

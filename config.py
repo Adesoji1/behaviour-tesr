@@ -233,16 +233,17 @@ def mysql_connect():
     )
 
 def prod_connect():
-    """Return a live READ-ONLY psycopg/psql-style connection to production.
+    """Return a live psycopg connection to production.
 
-    We use psycopg if available; the extractor falls back to the `psql` CLI so
-    no extra driver install is required.
+    NOTE: production is behind PgBouncer (a transaction-pooling pooler). Do NOT issue a
+    session-level `SET default_transaction_read_only` / `SET statement_timeout` on this
+    connection — it would persist on the pooled server connection and leak to the next
+    client, corrupting the pool. Scope read-only + timeout to each transaction with
+    `SET LOCAL` instead (see sync_manager._guarded_txn). This helper is currently unused;
+    the live path is sync_manager.py.
     """
     import psycopg  # type: ignore
-    conn = psycopg.connect(prod_pg_dsn())
-    # Belt-and-braces: force the session read-only so we can never mutate prod.
-    conn.execute("SET default_transaction_read_only = on")
-    return conn
+    return psycopg.connect(prod_pg_dsn())
 
 # ---------------------------------------------------------------------------
 # Pipeline parameters
@@ -277,6 +278,36 @@ CONFIDENCE_TRUST_THRESHOLD = int(os.getenv("BP_CONFIDENCE_TRUST", "60"))  # 0-10
 # are treated as bad data — excluded from the learned baseline so they can't poison
 # a customer's max/avg/p95 or the peer baseline. Default 10 trillion NGN.
 MAX_SANE_AMOUNT = float(os.getenv("BP_MAX_SANE_AMOUNT", "1e13"))
+
+# ---- Currency normalization -------------------------------------------------
+# The model is multi-currency (per the DB engineer: "define the model so it can support
+# multiple currencies"). Production currency values are NOT ISO-clean — e.g. 'POUND',
+# 'EURO', 'KSH', 'naira', stray whitespace/case. The learned profile is stored per
+# normalized currency, and scoring resolves a transaction's currency the SAME way, so a
+# transaction and its profile always agree on the code. Unknown codes pass through
+# upper-cased (a new currency becomes usable as pure data — no code change).
+DEFAULT_CURRENCY = os.getenv("BP_DEFAULT_CURRENCY", "NGN")
+_CURRENCY_ALIASES = {
+    "NAIRA": "NGN", "₦": "NGN",
+    "POUND": "GBP", "POUNDS": "GBP", "£": "GBP", "STERLING": "GBP",
+    "EURO": "EUR", "EUROS": "EUR", "€": "EUR",
+    "DOLLAR": "USD", "DOLLARS": "USD", "$": "USD", "USDOLLAR": "USD",
+    "KSH": "KES", "KSHS": "KES", "SHILLING": "KES",
+    "CEDI": "GHS", "CEDIS": "GHS",
+    "RAND": "ZAR",
+}
+
+
+def normalize_currency(raw) -> str:
+    """Canonical currency code. None / '' -> DEFAULT_CURRENCY. Known local aliases are
+    mapped (POUND->GBP, EURO->EUR, KSH->KES, ...); anything else is trimmed + upper-cased
+    and passed through, so an unseen ISO code just works."""
+    if raw is None:
+        return DEFAULT_CURRENCY
+    c = str(raw).strip().upper()
+    if not c:
+        return DEFAULT_CURRENCY
+    return _CURRENCY_ALIASES.get(c, c)
 # The offline history log can store a full JSON snapshot per entity per run. That
 # is heavy (~2KB/entity/run) and overflows a small test-DB's storage. Default OFF:
 # we keep only the compact scalar timeline (counts/amounts). Turn ON in production
@@ -302,9 +333,20 @@ DRIFT_AMOUNT_PCT = float(os.getenv("BP_DRIFT_AMOUNT_PCT", "0.5"))   # 0.5 = 50%
 # consecutive "anomalous vs their own profile" transactions (sustained drift =
 # repeated evidence, per §8) — not on a single one-off.
 DRIFT_SIGNAL_THRESHOLD = int(os.getenv("BP_DRIFT_SIGNAL_THRESHOLD", "5"))
-# Microservice: use the live recent-window velocity look-up (hits production
-# read-only per transaction). Turn off for pure profile scoring / offline tests.
+# Microservice: use the LIVE (production) recent-window velocity look-up (hits production
+# read-only per transaction — slow + prod load). Off by default; prefer LOCAL_VELOCITY.
 LIVE_VELOCITY = os.getenv("BP_LIVE_VELOCITY", "1") == "1"
+# LOCAL velocity (default ON): compute the recent-window burst features from the local
+# bp_recent_txn table — the transactions /score itself has seen. Real-time, ~ms, and NO
+# production read. This is the recommended burst-detection path. Takes precedence over
+# LIVE_VELOCITY when enabled.
+LOCAL_VELOCITY = os.getenv("BP_LOCAL_VELOCITY", "1") == "1"
+# Retention for bp_recent_txn (hours). Must exceed the longest velocity window (24h);
+# rows older than this are pruned off the hot path. Default 48h.
+VELOCITY_RETAIN_HOURS = float(os.getenv("BP_VELOCITY_RETAIN_HOURS", "48"))
+# Fraction of /score calls that also trigger a background prune of bp_recent_txn, so the
+# table stays bounded without a dedicated job or any hot-path cost. Default ~2%.
+VELOCITY_PRUNE_PROB = float(os.getenv("BP_VELOCITY_PRUNE_PROB", "0.02"))
 # SAFETY SWITCH — protect production. ALL live reads from the production Postgres
 # (per-customer retrain, the batch extract scripts, and live velocity) go through
 # this gate. Set BP_ALLOW_PROD_PULL=0 to STOP every live pull: retrains skip with a
@@ -340,4 +382,86 @@ SYNC_PRUNE = os.getenv("BP_SYNC_PRUNE", "1") == "1"
 # GET /demo runs a deliberately small live pull so the demo stays quick and is
 # provably light on production. The scheduled sync job uses the full cap above.
 DEMO_SYNC_MAX_ROWS = int(os.getenv("BP_DEMO_SYNC_MAX_ROWS", "2000"))
+# SCHEDULED INGESTION (production). The sync runs automatically on this interval as a
+# dedicated background service (`python sync_manager.py --loop`) — the ONLY production
+# reader, and NOT triggered by any HTTP request. This interval is exactly how fresh the
+# cache (and therefore the profiles) stays. Default 300s (5 min).
+SYNC_INTERVAL_SECONDS = int(os.getenv("BP_SYNC_INTERVAL_SECONDS", "300"))
+# DAILY schedule (production default): run the ingestion once a day at this wall-clock
+# time instead of on a fixed interval. Set BP_SYNC_AT_HOUR (0-23) to enable it; leave it
+# empty to fall back to the interval above. Minute defaults to 0. BP_SYNC_TZ names the
+# timezone the hour is read in (IANA name, e.g. Africa/Lagos) so "4am" means local 4am,
+# not UTC. Equivalent to a crontab `0 4 * * *` or a k8s CronJob, but self-contained in
+# the sync container (no host crond needed).
+_at = os.getenv("BP_SYNC_AT_HOUR", "").strip()
+SYNC_AT_HOUR = int(_at) if _at else None
+SYNC_AT_MINUTE = int(os.getenv("BP_SYNC_AT_MINUTE", "0"))
+SYNC_TZ = os.getenv("BP_SYNC_TZ", "UTC")
+# Run one sync immediately on scheduler start (a catch-up), then follow the schedule
+# above. 0 = wait for the first scheduled time instead. Useful so a deploy/restart does
+# not leave the cache stale until the next daily run.
+SYNC_RUN_ON_START = os.getenv("BP_SYNC_RUN_ON_START", "1") == "1"
+# ONE-TIME batch rebuild (`python retrain.py --rebuild-all`) — the initial seed of
+# profiles from the cache, the modern equivalent of build_profiles.py. It is NOT a
+# cron and NOT auto-fired: steady-state refresh is purely event-driven per customer
+# (retrain.maybe_retrain). This only skips customers with fewer than this many cached
+# rows (one-off noise); thin customers stay warming_up / peer-judged anyway.
+REBUILD_MIN_ROWS = int(os.getenv("BP_REBUILD_MIN_ROWS", "1"))
+
+# ---------------------------------------------------------------------------
+# SCORING (POST /score) — the fast, live decision endpoint.
+# ---------------------------------------------------------------------------
+# Where to POST every decision (the webhook). Empty = webhook disabled (the
+# decision is still returned in the HTTP response and saved to bp_decision).
+# Nothing is hard-coded — set BP_SCORE_WEBHOOK_URL to your consumer's endpoint.
+SCORE_WEBHOOK_URL = os.getenv("BP_SCORE_WEBHOOK_URL", "").strip()
+# How long to wait for the webhook before giving up (seconds). The webhook is sent
+# AFTER the HTTP response returns, so this never slows the caller down.
+SCORE_WEBHOOK_TIMEOUT = float(os.getenv("BP_SCORE_WEBHOOK_TIMEOUT", "5"))
+# Optional shared secret. When set, each webhook carries an HMAC-SHA256 signature
+# header (X-Behaviour-Signature) so the receiver can verify it came from us.
+SCORE_WEBHOOK_SECRET = os.getenv("BP_SCORE_WEBHOOK_SECRET", "")
+# ---- Webhook OUTBOX relay (guaranteed, retried delivery) --------------------
+# Each /score writes webhook_status='pending' in the SAME commit as the decision, so
+# no decision's delivery is ever lost to an API crash. A relay loop (in the sync
+# service) redelivers pending rows with exponential backoff until they succeed or
+# exhaust the retry budget — at-least-once delivery, no extra infrastructure.
+WEBHOOK_RELAY_ENABLED = os.getenv("BP_WEBHOOK_RELAY_ENABLED", "1") == "1"
+# How often the relay sweeps for due 'pending' rows.
+WEBHOOK_RELAY_INTERVAL_SECONDS = float(os.getenv("BP_WEBHOOK_RELAY_INTERVAL_SECONDS", "5"))
+# Max rows the relay handles per sweep (backpressure; the rest wait for the next sweep).
+WEBHOOK_RELAY_BATCH = int(os.getenv("BP_WEBHOOK_RELAY_BATCH", "100"))
+# Give up (mark 'dead' / dead-letter) after this many failed attempts.
+WEBHOOK_MAX_ATTEMPTS = int(os.getenv("BP_WEBHOOK_MAX_ATTEMPTS", "8"))
+# Exponential backoff: delay = min(base * 2^(attempt-1), cap), with +-20% jitter.
+# Defaults (base 5s, cap 1h, 8 attempts) span ~5s -> ~1h over roughly a day.
+WEBHOOK_BACKOFF_BASE_SECONDS = float(os.getenv("BP_WEBHOOK_BACKOFF_BASE_SECONDS", "5"))
+WEBHOOK_BACKOFF_CAP_SECONDS = float(os.getenv("BP_WEBHOOK_BACKOFF_CAP_SECONDS", "3600"))
+# Grace before the relay first touches a FRESH pending row — lets the fast inline
+# delivery in /score win the common case, so the relay only handles what that missed
+# (e.g. an API crash). A failed inline attempt sets its own shorter backoff, so this
+# grace does not delay retries — only the relay's very first look at an untouched row.
+WEBHOOK_RELAY_GRACE_SECONDS = float(os.getenv("BP_WEBHOOK_RELAY_GRACE_SECONDS", "30"))
+# Retraining rides on the transaction, but must NOT slow the live decision.
+# 1 = run the possible retrain AFTER the response is sent (recommended, fast).
+# 0 = run it inline before responding (slower; only for debugging).
+SCORE_RETRAIN_ASYNC = os.getenv("BP_SCORE_RETRAIN_ASYNC", "1") == "1"
+# Rule/blacklist/peer-baseline reference data is cached in process to keep /score fast.
+# It refreshes automatically after this many seconds; POST /reload forces it sooner.
+# This is the MAX time a rule/threshold/blacklist change takes to take effect. Lower =
+# fresher but more DB reads; higher = faster but staler. The per-customer profile is
+# NOT cached — it is always read live, so behaviour is never stale.
+RULES_CACHE_TTL = float(os.getenv("BP_RULES_CACHE_TTL", "30"))
+# Connection pool for the profile store. Opening a fresh Postgres connection costs
+# ~30ms; a pool reuses established ones so acquiring is microseconds — this is what
+# makes /score fast. Sized per process (uvicorn runs BP_WORKERS processes).
+STORE_POOL_MIN = int(os.getenv("BP_STORE_POOL_MIN", "2"))
+STORE_POOL_MAX = int(os.getenv("BP_STORE_POOL_MAX", "10"))
+# Max seconds to wait for a free connection before erroring (backpressure, not a hang).
+STORE_POOL_TIMEOUT = float(os.getenv("BP_STORE_POOL_TIMEOUT", "10"))
+
+# Where GET /demo writes the exact JSON it returns (one JSON object per line). The
+# database engineer asked to see and reuse these, so the folder is bind-mounted to
+# ./logs/demo on the host in docker-compose. Env-driven so the path is not hard-coded.
+DEMO_LOG_DIR = os.getenv("BP_DEMO_LOG_DIR", "/app/logs/demo")
 

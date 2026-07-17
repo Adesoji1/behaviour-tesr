@@ -112,11 +112,14 @@ def group_topn(df: pl.DataFrame, keys: list[str], col: str, n: int = TOPN) -> di
 
 def build_peer_baselines(df: pl.DataFrame, months: float, run_id: str) -> list[tuple]:
     """Non-ML cold-start baseline: average behaviour per peer group
-    (branch_id + account_type). A brand-new account with no history of its own
-    inherits its peer group's baseline until it accumulates its own. Plain group
-    arithmetic — no clustering, no embeddings, no ML."""
-    d = df.with_columns(pl.col("account_type").fill_null("unknown").alias("acct_type"))
-    grp = d.group_by(["branch_id", "acct_type"]).agg([
+    (branch_id + account_type + CURRENCY). A brand-new account with no history of its own
+    inherits its peer group's baseline IN THE TRANSACTION'S CURRENCY until it accumulates
+    its own. Plain group arithmetic — no clustering, no embeddings, no ML."""
+    d = df.with_columns(
+        pl.col("account_type").fill_null("unknown").alias("acct_type"),
+        pl.col("currency").map_elements(config.normalize_currency,
+                                        return_dtype=pl.Utf8, skip_nulls=False).alias("ccy"))
+    grp = d.group_by(["branch_id", "acct_type", "ccy"]).agg([
         pl.col("entity_key").n_unique().alias("peer_entities"),
         pl.len().alias("peer_tx_count"),
         pl.mean("amount").alias("avg_amount"),
@@ -127,17 +130,17 @@ def build_peer_baselines(df: pl.DataFrame, months: float, run_id: str) -> list[t
     ]).with_columns(
         avg_monthly_tx_count=(pl.col("peer_tx_count") / months / pl.col("peer_entities")),
     )
-    cities = group_topn(d, ["branch_id", "acct_type"], "city")
-    countries = group_topn(d, ["branch_id", "acct_type"], "origin_country")
-    # peak-hour histogram per peer group
-    hours = d.group_by(["branch_id", "acct_type", "hour"]).agg(pl.len().alias("c"))
+    cities = group_topn(d, ["branch_id", "acct_type", "ccy"], "city")
+    countries = group_topn(d, ["branch_id", "acct_type", "ccy"], "origin_country")
+    # peak-hour histogram per peer group (per currency)
+    hours = d.group_by(["branch_id", "acct_type", "ccy", "hour"]).agg(pl.len().alias("c"))
     hour_map: dict[tuple, dict] = {}
     for r in hours.iter_rows(named=True):
-        hour_map.setdefault((r["branch_id"], r["acct_type"]), {})[str(int(r["hour"]))] = int(r["c"])
+        hour_map.setdefault((r["branch_id"], r["acct_type"], r["ccy"]), {})[str(int(r["hour"]))] = int(r["c"])
 
     rows = []
     for r in grp.iter_rows(named=True):
-        key = (r["branch_id"], r["acct_type"])
+        key = (r["branch_id"], r["acct_type"], r["ccy"])
 
         def jnum(x):
             if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
@@ -145,7 +148,7 @@ def build_peer_baselines(df: pl.DataFrame, months: float, run_id: str) -> list[t
             return x
 
         rows.append((
-            r["branch_id"], r["acct_type"], int(r["peer_entities"]), int(r["peer_tx_count"]),
+            r["branch_id"], r["acct_type"], r["ccy"], int(r["peer_entities"]), int(r["peer_tx_count"]),
             jnum(r["avg_amount"]), jnum(r["median_amount"]), jnum(r["p95_amount"]),
             jnum(r["max_amount"]), jnum(r["std_amount"]), jnum(r["avg_monthly_tx_count"]),
             json.dumps(cities.get(key, {})), json.dumps(countries.get(key, {})),
@@ -160,11 +163,11 @@ def write_peer_baselines(rows: list[tuple]) -> None:
     conn = db.connect()
     cur = conn.cursor()
     cur.executemany(
-        "INSERT INTO bp_peer_baseline (branch_id, account_type, peer_entities, peer_tx_count, "
+        "INSERT INTO bp_peer_baseline (branch_id, account_type, currency, peer_entities, peer_tx_count, "
         "avg_amount, median_amount, p95_amount, max_amount, std_amount, avg_monthly_tx_count, "
         "usual_cities, usual_countries, peak_transaction_hours, build_run_id) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-        "ON CONFLICT (branch_id, account_type) DO UPDATE SET "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (branch_id, account_type, currency) DO UPDATE SET "
         "peer_entities=EXCLUDED.peer_entities, peer_tx_count=EXCLUDED.peer_tx_count, "
         "avg_amount=EXCLUDED.avg_amount, median_amount=EXCLUDED.median_amount, "
         "p95_amount=EXCLUDED.p95_amount, max_amount=EXCLUDED.max_amount, std_amount=EXCLUDED.std_amount, "
@@ -554,6 +557,11 @@ def build(in_path: str, prune: bool = True) -> None:
 
         prof = {
             "entity_key": ek,
+            # LEGACY batch path: this CSV builder aggregates a customer across ALL
+            # currencies into one blended row, tagged NGN. The per-currency profiles are
+            # produced by the modern path (retrain.py, from the cache). Kept NGN-defaulted
+            # so this path does not crash against the (entity_key, currency) grain.
+            "currency": config.DEFAULT_CURRENCY,
             "branch_id": r["branch_id"],
             "origin_account_no": r["origin_account_no"],
             "customer_id": None,
@@ -643,8 +651,8 @@ def build(in_path: str, prune: bool = True) -> None:
             prof["profile_version"] = (prev.get("profile_version", 0) + 1) if prev else 1
             profile_rows.append(prof)
             hist_rows.append((
-                ek, run_id, prof["profile_version"], prof["total_tx_count"], prof["total_tx_amount"],
-                prof["avg_amount"], prof["decayed_avg_amount"],
+                ek, prof["currency"], run_id, prof["profile_version"], prof["total_tx_count"],
+                prof["total_tx_amount"], prof["avg_amount"], prof["decayed_avg_amount"],
                 json.dumps(prof, default=str) if config.STORE_HISTORY_JSON else None,
             ))
             state_rows.append((
@@ -682,7 +690,7 @@ def write_store(run_id, window_start, window_end, source_rows, profile_rows, his
     if profile_rows:
         cols = list(profile_rows[0].keys())
         # profile_version is set explicitly in the row
-        sql = db.upsert_sql("bp_user_behaviour_profile", cols, ["entity_key"])
+        sql = db.upsert_sql("bp_user_behaviour_profile", cols, ["entity_key", "currency"])
         data = [tuple(p[c] for c in cols) for p in profile_rows]
         # commit periodically so a mid-run interruption persists progress instead of
         # rolling back a huge transaction (which bloats the InnoDB tablespace)
@@ -709,9 +717,9 @@ def write_store(run_id, window_start, window_end, source_rows, profile_rows, his
 
     for i in range(0, len(hist_rows), BATCH):
         cur.executemany(
-            "INSERT INTO bp_profile_history (entity_key, build_run_id, profile_version, "
+            "INSERT INTO bp_profile_history (entity_key, currency, build_run_id, profile_version, "
             "total_tx_count, total_tx_amount, avg_amount, decayed_avg_amount, profile_json) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             hist_rows[i:i + BATCH],
         )
         if i % (BATCH * 20) == 0:

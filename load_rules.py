@@ -18,7 +18,10 @@ import openpyxl
 import config
 import db
 
-# Default thresholds per rule. Windows in seconds unless noted. Amounts in NGN.
+# Default thresholds per rule. Windows in seconds unless noted. Amounts are in the rule's
+# own `currency` when it carries one (the per-currency escalation rules below), otherwise
+# NGN. The engine is multi-currency: a transaction is scored against the profile/peer
+# baseline FOR ITS CURRENCY, and a currency-bearing rule fires only for that currency.
 RULE_PARAMS = {
     "flag_blacklisted_users_transactions": {"source": "profile.is_blacklisted OR bp_blacklist"},
     "detect_unusual_country": {"baseline": "usual_countries", "min_history": 5},
@@ -29,6 +32,13 @@ RULE_PARAMS = {
     "high_outbound_amount_15m": {"window": "15m", "max_amount": 5000000},
     "many_users_to_one_account_1h": {"window": "1h", "max_distinct_senders": 10},
     "transaction_velocity_1m": {"window": "1m", "max_count": 3},
+    # PER-CURRENCY escalation (multi-currency by design). Each carries an explicit
+    # `currency` and fires ONLY for transactions in that currency, comparing the amount to
+    # `max_amount` in THAT currency. Adding a currency is pure data — e.g.
+    #   "escalate_gbp_above_10k": {"max_amount": 10000, "currency": "GBP"}
+    # and the engine picks it up with no code change (it fires any rule whose params carry
+    # a `currency` + `max_amount`). Currency values are normalized at match time (NGN,
+    # USD, GBP, ... ; POUND->GBP etc.), so aliases are safe here too.
     "escalate_single_transfer_above_10m_ngn": {"max_amount": 10000000, "currency": "NGN"},
     "escalate_foreign_above_10k_usd": {"max_amount": 10000, "currency": "USD"},
     "outbound_exceeds_historical_max": {"baseline": "max_amount", "factor": 1.0},
@@ -124,14 +134,18 @@ def mirror_blacklist(cur):
     """Read-only pull of users_blacklist from production via psql, insert to bp_blacklist."""
     env = dict(os.environ)
     env["PGPASSWORD"] = config.PROD_PG["password"]
+    env["PGSSLMODE"] = config.PROD_PG["sslmode"]
     q = ("SELECT id, blacklist_type, source, risk_level, name, entity_type, "
          "identifier_type, identifier, status, "
          "to_char(date_created, 'YYYY-MM-DD HH24:MI:SS') FROM users_blacklist")
+    # POOLER-SAFE: --single-transaction + SET LOCAL (scoped, reset on COMMIT). Command
+    # tags are further filtered below by the len(f) < 10 guard.
     out = subprocess.check_output(
         ["psql", "-h", config.PROD_PG["host"], "-p", str(config.PROD_PG["port"]),
          "-U", config.PROD_PG["user"], "-d", config.PROD_PG["dbname"],
-         "--set=sslmode=require", "-t", "-A", "-F", "\t",
-         "-c", "SET default_transaction_read_only = on;", "-c", q],
+         "-q", "-t", "-A", "-F", "\t", "--single-transaction",
+         "-c", f"SET LOCAL statement_timeout = {int(config.SYNC_STATEMENT_TIMEOUT_MS)}",
+         "-c", "SET LOCAL transaction_read_only = on", "-c", q],
         env=env, text=True,
     )
     rows = []

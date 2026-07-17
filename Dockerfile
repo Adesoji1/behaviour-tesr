@@ -7,6 +7,10 @@ FROM python:3.11-slim
 # appears the instant it is written.
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+# Standard container timezone (per the database engineer): everything runs in UTC, so
+# log timestamps and the daily ingestion schedule are unambiguous across environments.
+# The scheduler reads BP_SYNC_TZ separately (default UTC); keep them aligned.
+ENV TZ=UTC
 
 # psql client is required by the pipeline (reads production READ-ONLY) + TLS certs
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -26,4 +30,6 @@ COPY . .
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import urllib.request;urllib.request.urlopen('http://localhost:8080/health')" || exit 1
 
-CMD ["uvicorn", "service:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "2"]
+# Worker count is env-driven (BP_WORKERS, default 2) so throughput can be scaled to the
+# deployment's peak concurrency without a rebuild. Shell form so the var is expanded.
+CMD ["sh", "-c", "uvicorn service:app --host 0.0.0.0 --port 8080 --workers ${BP_WORKERS:-2}"]
