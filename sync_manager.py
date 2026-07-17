@@ -623,12 +623,22 @@ def main() -> int:
     ap.add_argument("--sleep", type=float, default=None, help="throttle between chunks")
     ap.add_argument("--refresh-days", type=int, default=None)
     ap.add_argument("--status", action="store_true", help="show sync state and exit")
+    ap.add_argument(
+        "--loop",
+        action="store_true",
+        help="PRODUCTION scheduler: sync forever on the configured schedule "
+        "(daily at BP_SYNC_AT_HOUR, or every BP_SYNC_INTERVAL_SECONDS)",
+    )
     a = ap.parse_args()
 
     if a.status:
         import json
 
         print(json.dumps(status(), indent=2, default=str))
+        return 0
+
+    if a.loop:
+        run_forever()
         return 0
 
     out = sync(
