@@ -272,7 +272,9 @@ CREATE TRIGGER trg_bp_peer_updated BEFORE UPDATE ON bp_peer_baseline
 CREATE TABLE IF NOT EXISTS bp_rule_event (
     id             BIGSERIAL PRIMARY KEY,
     entity_key     VARCHAR(128) NULL,
-    transaction_id VARCHAR(64)  NULL,
+    -- transaction_id mirrors production monitoring_transactionmonitoring.transaction_id (VARCHAR(255));
+    -- keeping it narrow here caused sync_manager to fail with `value too long for type character varying(64)`.
+    transaction_id VARCHAR(255) NULL,
     rule_code      VARCHAR(64)  NOT NULL,
     fired_at       TIMESTAMP    NOT NULL DEFAULT now(),
     severity       VARCHAR(16)  NULL,
@@ -289,7 +291,9 @@ CREATE INDEX IF NOT EXISTS idx_bp_evt_rule   ON bp_rule_event (rule_code);
 CREATE TABLE IF NOT EXISTS bp_event_log (
     id             BIGSERIAL PRIMARY KEY,
     entity_key     VARCHAR(128) NULL,
-    transaction_id VARCHAR(64)  NULL,
+    -- transaction_id mirrors production monitoring_transactionmonitoring.transaction_id (VARCHAR(255));
+    -- keeping it narrow here caused sync_manager to fail with `value too long for type character varying(64)`.
+    transaction_id VARCHAR(255) NULL,
     event_type     VARCHAR(32)  NOT NULL,
     outcome        VARCHAR(32)  NULL,
     detail         TEXT         NULL,
@@ -327,7 +331,9 @@ CREATE TABLE IF NOT EXISTS bp_build_run (
 CREATE TABLE IF NOT EXISTS bp_transactions_cache (
     id                          BIGINT       NOT NULL PRIMARY KEY,  -- production row id
     entity_key                  VARCHAR(128) NOT NULL,              -- branch_id:origin_account_no
-    transaction_id              VARCHAR(64)  NULL,
+    -- transaction_id mirrors production monitoring_transactionmonitoring.transaction_id (VARCHAR(255));
+    -- keeping it narrow here caused sync_manager to fail with `value too long for type character varying(64)`.
+    transaction_id              VARCHAR(255) NULL,
     amount                      NUMERIC(30,2) NULL,
     currency                    VARCHAR(8)   NULL,
     transaction_type            VARCHAR(64)  NULL,
