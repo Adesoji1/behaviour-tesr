@@ -314,6 +314,25 @@ def _pull_pass(
     return total, last_id
 
 
+def _remaining_rows(prod, start_id: int) -> int | None:
+    """Count how many production rows are still to pull (id > watermark, in the learning
+    window) so the progress bar can show a real percentage. One bounded, pooler-safe,
+    read-only COUNT. Returns None if it fails (the bar then just counts up)."""
+    try:
+        sql = (
+            f"SELECT count(*) AS n FROM {SOURCE_TABLE} "
+            f"WHERE id > %s AND {_BASE_FILTER} "
+            f"AND date_created >= (now() - interval '{int(config.LOOKBACK_MONTHS)} months')"
+        )
+        with _guarded_txn(prod), prod.cursor() as pc:
+            pc.execute(sql, (start_id,))
+            row = pc.fetchone()  # prod cursor yields dict rows
+            return int(row["n"] if isinstance(row, dict) else row[0])
+    except Exception as e:  # never let the progress total break the sync
+        audit.log.warning("could not count remaining rows for the progress bar: %s", e)
+        return None
+
+
 def _prune(store) -> int:
     """Drop cached rows older than the learning window (§6.2)."""
     cur = store.cursor()
@@ -367,15 +386,6 @@ def sync(
             refresh,
         )
 
-        bar = None
-        if progress and sys.stderr.isatty():
-            try:
-                from tqdm import tqdm
-
-                bar = tqdm(desc="syncing", unit="row", total=budget or None)
-            except Exception:
-                bar = None
-
         try:
             prod = _prod_conn()
         except ProdPullDisabled as e:
@@ -386,6 +396,22 @@ def sync(
                 "detail": str(e),
                 "note": "live reads from production are disabled (BP_ALLOW_PROD_PULL=0)",
             }
+
+        # Progress bar. Shown whenever progress=True (NOT gated on a TTY, so it also renders
+        # in a background run's log — watch it with `tail -f`). When there is no row cap we
+        # count the remaining rows so the bar shows a real % complete + ETA.
+        bar = None
+        if progress:
+            try:
+                from tqdm import tqdm
+
+                total = budget or _remaining_rows(prod, start_id)
+                bar = tqdm(
+                    desc="backfill", unit="row", total=total, file=sys.stdout,
+                    mininterval=2.0, dynamic_ncols=True, smoothing=0.05,
+                )
+            except Exception:
+                bar = None
 
         try:
             # Pass 1 — NEW rows since the watermark, inside the learning window.

@@ -187,6 +187,47 @@ docker compose exec behaviour-profile python retrain.py --rebuild-all
 
 After this, retraining is **event-driven per customer** — you never run `--rebuild-all` again.
 
+### How ingestion runs: the `sync` service (`--loop`) vs a one-shot pull
+
+All ingestion goes through one script, `sync_manager.py`, in one of two ways:
+
+**1. `python sync_manager.py --loop` — the PRODUCTION scheduler (the `sync` container).**
+A long-running process and the **only** thing that reads production. It never pulls on
+request; it runs on a schedule and catches every error so it never dies. Two schedules,
+chosen by env:
+
+- **Daily (production):** set `BP_SYNC_AT_HOUR` (0-23) → it pulls **once a day** at that
+  wall-clock time in `BP_SYNC_TZ` (default `UTC`). Recommended `04:00 UTC`, off-peak.
+  Equivalent to a cron `0 4 * * *`.
+- **Interval (dev / initial backfill):** leave `BP_SYNC_AT_HOUR` **unset** → it pulls **every
+  `BP_SYNC_INTERVAL_SECONDS`**. Used to churn through the first backfill quickly.
+
+`BP_SYNC_RUN_ON_START=1` does one catch-up pull the moment the container starts, then it
+follows the schedule. In Docker this is the `sync` service
+(`command: ["python","sync_manager.py","--loop"]`); in Kubernetes it is a `CronJob`
+(`schedule: "0 4 * * *"`, `concurrencyPolicy: Forbid`, one replica).
+
+**2. `python sync_manager.py` (no `--loop`) — a one-shot pull with a progress bar (DEV).**
+Runs a single pull and exits, printing a tqdm progress bar. Use it in **dev** to force-complete
+or inspect a backfill and watch it live:
+
+```bash
+# DEV ONLY: one-shot backfill in the background, watch % complete + ETA
+docker exec adhere-behaviour sh -c 'python sync_manager.py --max-rows 0 --sleep 0.25 > /app/logs/backfill/backfill.log 2>&1' &
+tail -f logs/backfill/backfill.log
+```
+`--max-rows 0` = no per-run cap (pull everything remaining); `--sleep` = throttle between chunks.
+
+> **In production you do NOT run the one-shot manually.** The `sync` service (`--loop`, daily
+> at 04:00 UTC) does all ingestion automatically. The one-shot + `tail -f` above is a **dev
+> convenience**; production keeps exactly **one** reader (the scheduled `sync` container /
+> CronJob), so never run a manual pull alongside it.
+
+**Safety (both modes):** every pull is keyset-paged, chunked (`BP_SYNC_CHUNK_SIZE`), throttled
+(`BP_SYNC_SLEEP_SECONDS`), statement-timed-out, **read-only** (pooler-safe `SET LOCAL`), and
+resumes from a watermark. `BP_ALLOW_PROD_PULL=0` pauses all production reads without stopping
+the service.
+
 ---
 
 ## 6. Guaranteed webhook delivery (the outbox)
@@ -320,3 +361,71 @@ Knobs: `LOCUST_USERS`, `LOCUST_SPAWN_RATE`, `LOCUST_RUN_TIME`, `SCORE_SLA_MS` (d
 - **Geo-velocity / impossible-travel** (GeoIP + haversine speed check).
 - **Per-currency thresholds** for the two remaining absolute NGN rules (`block_above_hard_cap`,
   `high_outbound_amount_15m`); the escalation rules are already per-currency.
+
+---
+
+## 13. Operations cheat-sheet (Docker commands + what to check)
+
+### Everyday Docker commands
+
+| Command | What it does |
+|---|---|
+| `docker compose up -d --build` | Build and start all 3 services (API, DB, `sync`). First deploy and after any code change. |
+| `docker compose ps` | Show which containers are up and healthy. |
+| `docker compose start sync` | **Start / resume ingestion** (the `--loop` scheduler). |
+| `docker compose stop sync` | **Stop ingestion** (no more production pulls). API + DB keep running; cached data is untouched. |
+| `docker compose restart behaviour-profile` | Restart just the API (e.g. after changing `.env`). |
+| `docker compose down` | Stop everything. **Keeps** the data volume. |
+| `docker compose down -v` | ⛔ **NEVER** where you care about the data — deletes the volume and every learned profile. |
+
+### Ingestion: where `--loop` runs, and start/stop in prod vs dev
+
+- The `sync` service runs `python sync_manager.py --loop` **automatically** (set in
+  `docker-compose.yaml`). This is the **only** process that reads production, and in normal
+  use you never start it by hand — `docker compose up -d` starts it with everything else.
+- **Production:** `sync` should be **running at all times** with `--loop`, on the **daily**
+  schedule (`BP_SYNC_AT_HOUR=4`, `BP_SYNC_TZ=UTC`) so it pulls once a day at 04:00 UTC, off-peak.
+  Only `docker compose stop sync` for planned maintenance, then `docker compose start sync`.
+- **Dev:** run **interval** mode (leave `BP_SYNC_AT_HOUR` unset → every
+  `BP_SYNC_INTERVAL_SECONDS`). Once the backfill is complete you can `docker compose stop sync`
+  to stop pulling from production, and `docker compose start sync` when you want fresh data again.
+- Full `--loop` explanation + the one-shot dev backfill are in §5.
+
+### Health and logs — what to check
+
+| Check | Command |
+|---|---|
+| API alive | `curl localhost:8080/health` → `{"status":"ok"}` |
+| Ingestion state (schedule, watermark, cache size, last status) | `curl localhost:8080/sync/status` |
+| System totals (customers, rules, per-currency) | `curl localhost:8080/stats` |
+| API logs (scoring, retrains, errors) | `docker compose logs -f behaviour-profile` |
+| Sync logs (ingestion runs, next scheduled pull, webhook relay) | `docker compose logs -f sync` |
+| Container status | `docker compose ps` |
+
+**Healthy `sync` logs look like:** `sync scheduler START — daily at 04:00 UTC`, then
+`sync: next scheduled ingestion in Xh`, and after each run `sync scheduler run done: {...}`.
+
+**Monitor in production:**
+- **Webhook dead-letter** (delivery gave up):
+  `docker exec behaviour-profile-db psql -U behaviour -d behaviour -c "SELECT count(*) FROM bp_decision WHERE webhook_status='dead';"`
+- **Ingestion status:** `GET /sync/status` → `last_status` should be `ok`.
+- **Scoring latency:** the `latency_ms` on each decision (also stored in `bp_decision`).
+
+### Environment config that must be set (recap of §4)
+
+**Production `.env`:** `STORE_PG_PASSWORD`, `PROD_PG_*`, `PGSSLMODE=require` (secrets);
+`BP_ALLOW_PROD_PULL=1`; `BP_SYNC_AT_HOUR=4`, `BP_SYNC_TZ=UTC`, `BP_SYNC_RUN_ON_START=1`,
+`BP_SYNC_MAX_ROWS=0` (daily ingestion); `BP_SCORE_WEBHOOK_URL` (+ `BP_SCORE_WEBHOOK_SECRET`);
+`BP_LOCAL_VELOCITY=1`, `BP_LIVE_VELOCITY=0`; `BP_WORKERS=4`, `BP_STORE_POOL_MAX=12`.
+
+**Dev / first backfill `.env`:** leave `BP_SYNC_AT_HOUR` **unset** (interval mode);
+`BP_SYNC_INTERVAL_SECONDS=120`, `BP_SYNC_MAX_ROWS=20000`.
+
+### First deploy to production, in order
+
+1. `cp .env.example .env`, fill the secrets, set the **dev/backfill** ingestion vars (§4c).
+2. `docker compose up -d --build`.
+3. Let the backfill finish (watch `GET /sync/status` until `cache_rows` stops growing; or run the §5 one-shot).
+4. `docker compose exec behaviour-profile python retrain.py --rebuild-all` (build the initial profiles).
+5. Switch `.env` to the **production** ingestion vars (§4b), then `docker compose up -d` to apply.
+6. Confirm: `curl localhost:8080/sync/status` shows `schedule: daily at 04:00 UTC`.

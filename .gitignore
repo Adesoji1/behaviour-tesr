@@ -41,3 +41,7 @@ migrate_dumps/
 !docs/loadtest/
 !docs/loadtest/*.csv
 !docs/loadtest/*.log
+
+# Model-response SAMPLE from the production behavioral_analysis table (customer-derived
+# data: amounts, locations). Kept locally for reference, never committed.
+behavioral_analysis_data
