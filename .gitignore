@@ -58,3 +58,5 @@ demo/bf_category_tests.txt
 
 # demo payloads contain a real customer identifier (PII)
 demo/*payload*.json
+# ...but keep the SANITISED template (synthetic values only) so the demo is self-contained.
+!demo/payload.example.json

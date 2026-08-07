@@ -1,0 +1,29 @@
+{
+  "account_type": "individual",
+  "additional_info": {
+    "ip_address": "203.0.113.10",
+    "location": "Lagos, Nigeria",
+    "transaction_description": "Payment for order #123"
+  },
+  "amount": 25000000,
+  "currency": "NGN",
+  "customer_details": {
+    "country": "Nigeria",
+    "customer_email": "jane.doe@example.com",
+    "customer_name": "Jane Doe (EXAMPLE — replace with a real customer to test a personal profile)",
+    "identifier": "00000000000",
+    "identifier_type": "bvn"
+  },
+  "destination_account": {
+    "account_number": "0000000000",
+    "bank_code": "002"
+  },
+  "origin_account": {
+    "account_number": "1111111111",
+    "bank_code": "001"
+  },
+  "run_kyc": false,
+  "timestamp": "2026-08-02T14:00:00Z",
+  "transaction_id": "EXAMPLE-0001",
+  "transaction_type": "inter_transfer"
+}

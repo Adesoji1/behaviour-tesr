@@ -64,6 +64,29 @@ docker compose --profile train run --rm trainer --promote
 It promotes the new model **only if it beats the current active** on the synthetic-anomaly AUC.
 Confirm: `python -m ml.monitor` (or check `artifacts/registry/index.json` has an `active` version).
 
+### The model is shipped OUT-OF-BAND — never in git
+
+The trained model files (`artifacts/models/<version>/featurebuilder.joblib`, …) contain
+**customer-derived data** — per-customer identifiers, their beneficiary account numbers and IP
+subnets — so they are **git-ignored and must never be committed** (zipping them does not change
+that; the data is still inside). The git repo carries the **code + `schema_pg.sql`** only.
+
+Two ways the model reaches production, both PII-safe:
+
+- **From the build/operator host (default):** `deploy.sh` rsyncs your local `artifacts/models` +
+  `artifacts/registry` to the serving host (step 4). Nothing to prepare.
+- **Deploying on a host that only has a git clone** (empty `artifacts/`): ship a **model bundle** and
+  let `deploy.sh` unpack it. Build the bundle once on a host that has the models:
+  ```bash
+  tar czf model-bundle.tar.gz \
+      artifacts/models/<active-version> artifacts/models/<previous-version> artifacts/registry/index.json
+  ```
+  Transfer `model-bundle.tar.gz` **out-of-band** (scp / secure bucket) to the deploy host, next to
+  `deploy.sh` (or point `MODEL_BUNDLE=/path/to/model-bundle.tar.gz` at it). `deploy.sh` extracts it
+  into `./artifacts` (step 3b) so the models land in `artifacts/models/` exactly as
+  `registry/index.json` expects. Include **both the active and the previous** model so
+  `registry.rollback()` works immediately.
+
 ## 3. Run the deploy
 
 ```bash
@@ -77,6 +100,9 @@ What it does, in order (and logs to `./logs/deploy_*.log`):
 3. **Promotes the learnt profiles** into the production behaviour store (`pg_dump --data-only` of
    `bp_user_behaviour_profile`, `bp_peer_baseline`, `bp_sync_state`) — so **production starts from
    the learnt state, not from zero**.
+3b. **Unpacks the model bundle** if one is present (`MODEL_BUNDLE`, default `./model-bundle.tar.gz`)
+   into `./artifacts` — the out-of-band way to get the model onto a host that only has a git clone
+   (see §2). Skipped when `artifacts/models` is already populated.
 4. **Promotes the validated model** artifacts + registry (`PROD_ARTIFACTS_DEST`, or a shared volume).
 5. **Checks `/health`** — the service is up and answering.
 6. Reports success/failure to Slack.

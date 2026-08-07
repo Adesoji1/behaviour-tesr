@@ -758,8 +758,15 @@ webhook arriving at webhook.site; `bp_decision` (`webhook_status=sent`); the ML 
 
 - **`./deploy.sh`** — operator-run. Confirms the server IP (prompts on a TTY, else
   `PROD_IP_ALLOWLISTED=yes`), **verifies the production Postgres connection directly**, promotes the
-  learnt **profiles** into the production behaviour store and the validated **model artifacts +
-  registry**, then checks `/health`. Logs everything to `./logs/deploy_*.log`; reports to Slack.
+  learnt **profiles** into the production behaviour store, **unpacks the out-of-band model bundle**
+  if present (step 3b), promotes the validated **model artifacts + registry**, then checks `/health`.
+  Logs everything to `./logs/deploy_*.log`; reports to Slack.
+- **The model is shipped OUT-OF-BAND, never in git** — the model files contain customer-derived
+  identifiers, beneficiary account numbers and IP subnets, so the repo carries **code +
+  `schema_pg.sql`** only. On a host that has the trained `artifacts/` (build/operator host), `deploy.sh`
+  rsyncs them across; on a host that only has a git clone, transfer a **model bundle** and `deploy.sh`
+  unpacks it into `./artifacts` (`MODEL_BUNDLE`, default `./model-bundle.tar.gz`). Bundle **both** the
+  active and previous model so `registry.rollback()` works. Full steps: **[`DEPLOYMENT.md`](DEPLOYMENT.md) §2**.
 - **`./watchdog.sh`** — always-on. Slacks (with the real cause + last logs) when a container dies /
   goes unhealthy, or when an ERROR / **profile-retrain failure** appears in the audit log.
 - Slack for both is `BP_SLACK_WEBHOOK_URL` (no-op until you set it; alerts are logged meanwhile).

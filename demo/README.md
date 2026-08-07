@@ -7,11 +7,19 @@ model is deciding from **learned history vs the real-time payload**, not guessin
 ```bash
 # stack up
 docker compose up -d db redis behaviour-profile sync
-# review the decision for the payload in demo/payload.json:
+# make your own payload from the sanitised template (payload.json is git-ignored — it holds a
+# REAL customer identifier, so it is never committed):
+cp demo/payload.example.json demo/payload.json      # then edit amount / customer / beneficiary
+# review the decision for demo/payload.json:
 ./demo/run_audit.sh
 # or a different payload file:
 ./demo/run_audit.sh demo/my_payload.json
 ```
+
+> `demo/payload.example.json` is committed and uses **synthetic** values only (identifier
+> `00000000000`, "Jane Doe") — safe to share. To exercise a customer's **personal** profile,
+> copy it to `demo/payload.json` and substitute a real customer's details locally; that file stays
+> git-ignored so no customer PII is committed.
 
 ## Files
 | File | What it is |

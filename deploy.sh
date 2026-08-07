@@ -108,6 +108,26 @@ pg_dump "$SRC_STORE_DSN" --data-only --no-owner --on-conflict-do-nothing 2>/dev/
   || fail "profile promotion (pg_dump | psql) failed"
 log "Profiles promoted (production starts from the learnt state, not from zero)."
 
+# 3b) Unpack the MODEL BUNDLE if present. The trained model + registry are shipped OUT-OF-BAND
+#     (never committed to git — the model files contain customer-derived identifiers, beneficiary
+#     account numbers and IP subnets, so they must not enter the repo). Transfer the bundle to this
+#     host next to deploy.sh (or point MODEL_BUNDLE at it) and it is extracted into ./artifacts so
+#     the models land in artifacts/models/ EXACTLY as artifacts/registry/index.json expects — both
+#     the ACTIVE and the PREVIOUS model, so registry.rollback() works out of the box. Idempotent;
+#     skipped when no bundle is present (e.g. artifacts/ is already populated on this host).
+MODEL_BUNDLE="${MODEL_BUNDLE:-$HERE/model-bundle.tar.gz}"
+if [ -f "$MODEL_BUNDLE" ]; then
+  log "Unpacking model bundle ${MODEL_BUNDLE} -> ./artifacts ..."
+  tar xzf "$MODEL_BUNDLE" -C "$HERE" || fail "could not extract model bundle ${MODEL_BUNDLE}"
+  log "Model bundle unpacked (active: $(grep -o '"active"[^,]*' artifacts/registry/index.json 2>/dev/null | head -1))."
+elif [ -d artifacts/models ] && [ -n "$(ls -A artifacts/models 2>/dev/null)" ]; then
+  log "No model bundle at ${MODEL_BUNDLE} — using the models already present in ./artifacts/models."
+else
+  log "WARNING: no model bundle at ${MODEL_BUNDLE} and ./artifacts/models is empty — /score would have"
+  log "         no model to load. Transfer the out-of-band model bundle here (or set MODEL_BUNDLE), or"
+  log "         run a training job:  docker compose --profile train run --rm trainer --promote"
+fi
+
 # 4) Promote the VALIDATED MODEL artifacts + registry to the serving host.
 if [ -n "${PROD_ARTIFACTS_DEST:-}" ]; then
   log "Promoting model artifacts + registry -> ${PROD_ARTIFACTS_DEST} ..."
