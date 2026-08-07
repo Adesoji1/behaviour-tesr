@@ -121,17 +121,6 @@ no redeploy. Each entry says, in one line, WHAT it does and WHAT the number mean
                        build. Great for point-in-time analysis, but heavy (~2KB x 100k
                        profiles per run — it once filled the test DB and flipped it
                        read-only). Default 0: keep only the compact timeline.
-
---- 8. LEGACY (only migrate_mysql_to_pg.py uses these) -------------------------
-  The OLD MySQL store. Kept only so the already-learned profiles can be copied into
-  Postgres. The running service never touches it; delete once the migration is signed
-  off.
-  TEST_MYSQL_HOST      Address of the old MySQL server.
-  TEST_MYSQL_PORT      Its port.                                       (18844)
-  TEST_MYSQL_USER      Username.
-  TEST_MYSQL_PASSWORD  Password.                                       (SECRET)
-  TEST_MYSQL_DB        Database name.                                  (defaultdb)
-  TEST_MYSQL_CA        Path to its TLS certificate (ca.pem).
 ==============================================================================
 """
 import os
@@ -195,42 +184,6 @@ def pg_store_dsn() -> str:
         f"connect_timeout=30 application_name=behaviour-profile"
     )
 
-
-# ---------------------------------------------------------------------------
-# LEGACY MySQL — kept ONLY so migrate_mysql_to_pg.py can copy the existing
-# profiles across. Nothing in the running service uses this any more.
-# ---------------------------------------------------------------------------
-TEST_MYSQL = {
-    "host": os.getenv("TEST_MYSQL_HOST", "localhost"),
-    "port": int(os.getenv("TEST_MYSQL_PORT", "3306")),
-    "user": os.getenv("TEST_MYSQL_USER", "root"),
-    "password": os.getenv("TEST_MYSQL_PASSWORD", ""),
-    "database": os.getenv("TEST_MYSQL_DB", "defaultdb"),
-    "ssl_ca": os.getenv("TEST_MYSQL_CA", os.path.join(BASE_DIR, "ca.pem")),
-}
-
-def _resolve_ca(path: str) -> str:
-    """Use the configured CA path if it exists (e.g. /app/ca.pem in Docker);
-    otherwise fall back to ca.pem next to this file (local runs)."""
-    if path and os.path.exists(path):
-        return path
-    local = os.path.join(BASE_DIR, "ca.pem")
-    return local if os.path.exists(local) else path
-
-def mysql_connect():
-    """LEGACY — a pymysql connection to the old MySQL store.
-
-    Only `migrate_mysql_to_pg.py` uses this, to copy the already-learned profiles
-    into PostgreSQL. The service itself now talks to Postgres via `db.connect()`.
-    """
-    import pymysql
-    m = TEST_MYSQL
-    return pymysql.connect(
-        host=m["host"], port=m["port"], user=m["user"],
-        password=m["password"], database=m["database"],
-        ssl={"ca": _resolve_ca(m["ssl_ca"])}, connect_timeout=30, charset="utf8mb4",
-        autocommit=False,
-    )
 
 def prod_connect():
     """Return a live psycopg connection to production.
@@ -411,6 +364,13 @@ REBUILD_MIN_ROWS = int(os.getenv("BP_REBUILD_MIN_ROWS", "1"))
 # ---------------------------------------------------------------------------
 # SCORING (POST /score) — the fast, live decision endpoint.
 # ---------------------------------------------------------------------------
+# The behavioural anti-fraud MODEL (the unsupervised ensemble in ml/) is the decision
+# engine behind /score. When true (default) /score returns the MODEL's decision — the
+# transaction is compared against the customer's learned profile/history and the ensemble
+# decides. Set BP_USE_MODEL=false to fall back to the legacy rule-engine path (rollback).
+# Inference is CPU-only; the GPU is used ONLY by the separate offline training job.
+USE_MODEL = os.getenv("BP_USE_MODEL", "true").lower() in ("1", "true", "yes", "on")
+
 # Where to POST every decision (the webhook). Empty = webhook disabled (the
 # decision is still returned in the HTTP response and saved to bp_decision).
 # Nothing is hard-coded — set BP_SCORE_WEBHOOK_URL to your consumer's endpoint.
@@ -446,6 +406,18 @@ WEBHOOK_RELAY_GRACE_SECONDS = float(os.getenv("BP_WEBHOOK_RELAY_GRACE_SECONDS", 
 # 1 = run the possible retrain AFTER the response is sent (recommended, fast).
 # 0 = run it inline before responding (slower; only for debugging).
 SCORE_RETRAIN_ASYNC = os.getenv("BP_SCORE_RETRAIN_ASYNC", "1") == "1"
+# ---- API-key auth for POST /score (header X-Adhere-Key) ---------------------
+# The single active key. Set BP_API_KEY in .env for a simple/fixed key (this value,
+# hashed, becomes THE active key and OVERRIDES the DB) — the container reads it from
+# the environment. Leave it EMPTY to use the DB-managed rotating key instead
+# (manage_api_key.py rotate: hashed, one active at a time, rotating invalidates the
+# former). Generate the value with `openssl rand -hex 32`.
+API_KEY = os.getenv("BP_API_KEY", "").strip()
+# Turn auth OFF entirely (internal/dev only) — /score then needs no header.
+API_KEY_DISABLED = os.getenv("BP_API_KEY_DISABLED", "").strip().lower() in ("1", "true", "yes", "on")
+# Seconds the service caches the active DB key hash (rotation is picked up within this
+# window, or immediately via POST /reload). Ignored when BP_API_KEY is set.
+API_KEY_CACHE_TTL = int(os.getenv("BP_API_KEY_CACHE_TTL", "30"))
 # Rule/blacklist/peer-baseline reference data is cached in process to keep /score fast.
 # It refreshes automatically after this many seconds; POST /reload forces it sooner.
 # This is the MAX time a rule/threshold/blacklist change takes to take effect. Lower =

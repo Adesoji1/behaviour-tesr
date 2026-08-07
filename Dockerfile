@@ -32,4 +32,7 @@ HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import urllib.request;url
 
 # Worker count is env-driven (BP_WORKERS, default 2) so throughput can be scaled to the
 # deployment's peak concurrency without a rebuild. Shell form so the var is expanded.
-CMD ["sh", "-c", "uvicorn service:app --host 0.0.0.0 --port 8080 --workers ${BP_WORKERS:-2}"]
+# PREFLIGHT: validate REQUIRED config (an API key must be configured — env or DB) using the SAME
+# validator the app runs at startup. On failure it exits non-zero, so `&&` stops uvicorn from ever
+# binding and the container exits CLEANLY with a clear error — instead of workers crash-looping.
+CMD ["sh", "-c", "python -c 'import service; service._require_api_key_configured()' && uvicorn service:app --host 0.0.0.0 --port 8080 --workers ${BP_WORKERS:-2}"]

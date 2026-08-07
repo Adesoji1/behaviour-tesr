@@ -1,0 +1,28 @@
+# GPU-capable inference API for the behavioural anti-fraud microservice (FastAPI + uvicorn).
+# The Autoencoder/GNN use the GPU automatically when present (ml.hardware); run with `--gpus all`.
+# Serves Swagger at /docs and POST /score. Model artifacts are mounted at /app/artifacts.
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq5 build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Single source of truth: the SAME pinned requirements the training image uses, so serving loads
+# the model pickles with identical library versions (no version skew). torch/numpy come from base.
+COPY ml/requirements-ml.txt /app/ml/requirements-ml.txt
+RUN pip install --no-cache-dir -r /app/ml/requirements-ml.txt
+
+COPY ml/ /app/ml/
+
+# Reach the store; override BF_PG_* / BF_WEBHOOK_URL via env. On Linux run with --network host
+# so BF_PG_HOST=localhost:5433 (the published store) is reachable, or point BF_PG_HOST at the DB.
+ENV BF_PG_HOST=localhost BF_PG_PORT=5433 BF_ARTIFACTS_DIR=/app/artifacts
+EXPOSE 8085
+
+#   docker build -f Dockerfile.api -t adhere-bf-api .
+#   docker run --gpus all --network host -e BF_PG_PASSWORD=... \
+#     -v $PWD/artifacts:/app/artifacts adhere-bf-api
+CMD ["uvicorn", "ml.api:app", "--host", "0.0.0.0", "--port", "8085"]

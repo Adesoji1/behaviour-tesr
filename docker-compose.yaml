@@ -4,7 +4,7 @@
 #   docker compose up -d --build
 #   docker compose logs -f
 #
-# Service:  http://localhost:8080   (docs /docs, demo /demo)
+# Service:  http://localhost:8080   (Swagger /docs, score POST /score)
 # Sync:     a SEPARATE background service pulls production on a schedule (the ONLY
 #           production reader) — it is NOT triggered by any HTTP request.
 # Store:    PostgreSQL 17 on 127.0.0.1:5432 (loopback only — never published wide)
@@ -13,6 +13,29 @@
 # It does NOT survive `docker compose down -v` — never use -v here.
 # A volume is not a backup: schedule pg_dump (see RUNBOOK).
 services:
+
+  # ---------------------------------------------------------------------------
+  # LIVE-VELOCITY store (Redis) — short-lived per-customer transaction window used to compute the
+  # real-time velocity/recency ML features (see ml/live_velocity.py). It is a STATE STORE, not a
+  # fraud engine. Enrichment-only + fail-safe: if this is down, /score keeps working on the cache.
+  # Durable across restarts via the redis-data volume (RDB snapshots); TTL-bounded so it self-cleans.
+  redis:
+    image: redis:7-alpine
+    container_name: adhere-redis
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-ttl"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
   db:
     image: postgres:17
     container_name: behaviour-profile-db
@@ -56,13 +79,29 @@ services:
     environment:
       STORE_PG_HOST: db                 # reach the store over the compose network
       STORE_PG_PORT: 5432
+      # /score is served by the behavioural MODEL in-process (CPU). false = legacy rule engine.
+      # The embedded model reads the store via BF_PG_* -> falls back to STORE_PG_* (db:5432), so
+      # no extra DB config is needed here.
+      BP_USE_MODEL: ${BP_USE_MODEL:-true}
+      BP_SCORE_WEBHOOK_URL: ${BP_SCORE_WEBHOOK_URL:-}
+      # API-key auth for POST /score. Loaded from .env; explicit here so it's visible.
+      # Empty -> the DB-managed rotating key (manage_api_key.py) is used instead.
+      BP_API_KEY: ${BP_API_KEY:-}
+      # Live-velocity store (real-time burst features). Defaults to the compose `redis` service.
+      # Set empty to disable (velocity falls back to the batch cache). Fail-safe if Redis is down.
+      BP_REDIS_URL: ${BP_REDIS_URL:-redis://redis:6379/0}
     volumes:
       # The database engineer reads the exact JSON every GET /demo returns here.
       # Container writes to /app/logs/demo (config.DEMO_LOG_DIR); host sees ./logs/demo.
       - ./logs:/app/logs
+      # The promoted MODEL the trainer produced (loaded at startup for /score). Shared with the
+      # trainer service so training and serving use the same artifacts.
+      - ./artifacts:/app/artifacts
     depends_on:
       db:
         condition: service_healthy      # never start before the store is ready
+      redis:
+        condition: service_started      # start Redis first, but DON'T block on it (fail-safe)
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8080/health')"]
@@ -109,6 +148,43 @@ services:
         max-file: "5"
 
   # ---------------------------------------------------------------------------
+  # OFFLINE TRAINER (opt-in, GPU) — builds + promotes the behavioural MODEL, then EXITS.
+  # This is the ONLY GPU component; serving needs no GPU. Run it on a schedule (cron / k8s
+  # CronJob) or gate it with `python -m ml.retrain_trigger --run`:
+  #   docker compose --profile train run --rm trainer --promote
+  # It writes the promoted model to the SAME ./artifacts the behaviour-profile service loads.
+  # Needs the NVIDIA Container Toolkit; without a GPU it falls back to CPU (slower).
+  # ---------------------------------------------------------------------------
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile.ml
+    image: adhere-bf-ml:latest
+    container_name: adhere-bf-trainer
+    profiles: ["train"]                    # excluded from normal `up`
+    env_file:
+      - .env
+    environment:
+      BF_PG_HOST: db                       # read the store over the compose network
+      BF_PG_PORT: 5432
+      BF_LOG_FILE: /app/logs/ml.log
+      BF_MIN_TXNS: ${BF_MIN_TXNS:-50}
+      BF_MIN_DAYS_ACTIVE: ${BF_MIN_DAYS_ACTIVE:-30}
+    volumes:
+      - ./artifacts:/app/artifacts         # promoted model lands here (shared with serving)
+      - ./logs:/app/logs                   # ML-job audit logs (ml.log)
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:                                # request the GPU (NVIDIA Container Toolkit)
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ---------------------------------------------------------------------------
   # LOAD TEST (opt-in) — Locust against POST /score. Never starts by default; run it
   # explicitly with the `loadtest` profile:
   #   docker compose --profile loadtest run --rm loadtest
@@ -145,3 +221,5 @@ services:
 volumes:
   pgdata17:                             # named volume — the profile store lives here
     name: behaviour_pgdata17
+  redis-data:                           # live-velocity window (durable across Redis restarts)
+    name: behaviour_redis_data

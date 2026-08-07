@@ -1,0 +1,31 @@
+# =============================================================================
+# Behavioural Anti-Fraud — OPTIONAL scheduled retraining (host cron, docker compose).
+#
+#   *** DISABLED BY DEFAULT — we retrain MANUALLY for now. ***
+#
+# Retraining is intentionally NOT automated yet. You are NOTIFIED when a retrain is due
+# (Slack, from the always-on `sync` service after each pull, and from deploy.sh), then you
+# run the retrain by hand when you choose — see README "Manual model retraining".
+#
+# The retrain is SELF-GATING either way: it retrains and promotes the new model ONLY if it
+# is at least as good as the active one (synthetic-anomaly AUC / precision). A worse model
+# NEVER replaces the current one — the active model stays.
+#
+# WHEN YOU LATER WANT TO AUTOMATE IT (still no Kubernetes needed — this is plain host cron
+# driving docker compose): uncomment the three lines below and install with
+#     crontab deploy/crontab.example
+# Set APPDIR to your checkout. Times are the host's local time.
+# =============================================================================
+APPDIR=/opt/ai-service
+SHELL=/bin/bash
+
+# --- automatic retraining (COMMENTED OUT — enable only when you decide to automate) ---------
+# 1) DAILY model retrain at 04:30, right AFTER the 04:00 pull (BP_SYNC_AT_HOUR=4). Detects §4
+#    triggers, retrains on the GPU, promotes ONLY if it beats the active model.
+#30 4 * * *  cd $APPDIR && docker compose --profile train run --rm --entrypoint python trainer -m ml.retrain_trigger --run >> logs/retrain.log 2>&1
+#
+# 2) Roll a newly promoted model out to serving with no downtime.
+#35 4 * * *  cd $APPDIR && curl -fsS -X POST http://localhost:8080/reload >> logs/retrain.log 2>&1
+#
+# 3) HOURLY live drift / health watch (Slack alert on over/under-flagging). Advisory only.
+#0 * * * *   cd $APPDIR && docker compose --profile train run --rm --entrypoint python trainer -m ml.monitor --live >> logs/monitor.log 2>&1

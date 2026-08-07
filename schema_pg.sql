@@ -540,3 +540,61 @@ BEGIN
   END IF;
 END $$;
 CREATE INDEX IF NOT EXISTS idx_bp_profile_entity ON bp_user_behaviour_profile (entity_key);
+
+-- ---------------------------------------------------------------------------
+-- API keys for POST /score (the X-Adhere-Key header). Only the SHA-256 HASH is
+-- stored (never the plaintext). Exactly ONE row is active at a time; rotating a
+-- new key sets active=false on all previous keys. Managed by manage_api_key.py.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS bp_api_key (
+    id          BIGSERIAL PRIMARY KEY,
+    key_hash    VARCHAR(64) NOT NULL,
+    label       VARCHAR(120),
+    active      BOOLEAN NOT NULL DEFAULT true,
+    created_at  TIMESTAMP NOT NULL DEFAULT now(),
+    revoked_at  TIMESTAMP NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_bp_api_key_one_active ON bp_api_key (active) WHERE active;
+
+-- ---------------------------------------------------------------------------
+-- bp_alert_state — one row per alert kind (e.g. 'retrain_due', 'live_drift').
+-- Stores the LAST announced signature so an alert is Slacked ONCE per state
+-- change (edge-triggered de-dup), not on every scheduled pull. Written by the
+-- sync service (_alert_once). Survives restarts.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS bp_alert_state (
+    alert_key   VARCHAR(64) PRIMARY KEY,
+    signature   TEXT,
+    updated_at  TIMESTAMP NOT NULL DEFAULT now()
+);
+
+-- ---------------------------------------------------------------------------
+-- bp_decision_feedback — the ANALYST FEEDBACK LOOP (closes PDF §11).
+-- When the fraud-analyst team reviews a decision the model wrote to bp_decision
+-- (e.g. a 'review' or 'unsafe'/auto-block) and confirms the ground truth, they
+-- POST /feedback and we store their verdict here, keyed by transaction_id.
+--   verdict = 'genuine'  -> the transaction was legitimate (a FALSE POSITIVE if the
+--                           model had flagged it). At the next retrain it is FORCED
+--                           into the CLEAN training set even if the source status
+--                           looked suspicious — so the model learns it as normal.
+--   verdict = 'fraud'    -> the transaction was truly fraudulent. It is FORCED OUT
+--                           of the clean training set (§7 "never learn confirmed
+--                           fraud"), regardless of the source status.
+-- These verdicts also give ml.monitor --live a REAL precision signal (flagged
+-- decisions that analysts later confirmed fraud vs genuine), replacing the
+-- flag-rate-only drift proxy. One row per transaction (latest verdict wins).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS bp_decision_feedback (
+    id             BIGSERIAL PRIMARY KEY,
+    transaction_id VARCHAR(100) NOT NULL,
+    entity_key     VARCHAR(128) NULL,          -- resolved from bp_decision when known
+    decision       VARCHAR(16)  NULL,          -- the model's decision at feedback time (audit)
+    verdict        VARCHAR(16)  NOT NULL,      -- 'genuine' | 'fraud'
+    analyst        VARCHAR(120) NULL,          -- who gave the verdict (optional)
+    note           TEXT         NULL,          -- free-text reason (optional)
+    created_at     TIMESTAMP    NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMP    NOT NULL DEFAULT now()
+);
+-- one verdict per transaction — a re-submission UPDATEs the existing row (latest wins)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_bp_decision_feedback_txn ON bp_decision_feedback (transaction_id);
+CREATE INDEX IF NOT EXISTS idx_bp_decision_feedback_verdict ON bp_decision_feedback (verdict, created_at DESC);

@@ -27,6 +27,7 @@ from psycopg.rows import dict_row, tuple_row
 import config
 
 _SCHEMA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema_pg.sql")
+_SCHEMA_LOCK_KEY = 4127384651  # arbitrary constant so all workers contend on the SAME advisory lock
 
 # ---------------------------------------------------------------------------
 # Connection pool — reuse established connections instead of opening one per
@@ -90,6 +91,11 @@ def ensure_schema() -> None:
     sql = open(_SCHEMA_FILE, encoding="utf-8").read()
     conn = connect()
     try:
+        # Serialize concurrent workers: with `--workers N` every worker runs ensure_schema at
+        # startup, and running the same catalog DDL simultaneously raises Postgres
+        # "tuple concurrently updated". A transaction-level advisory lock makes them run one at a
+        # time (the DDL is idempotent, so the later runs are no-ops). The lock releases on commit.
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_KEY,))
         conn.execute(sql)          # psycopg runs a multi-statement script in one call
         conn.commit()
     finally:

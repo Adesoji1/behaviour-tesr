@@ -9,6 +9,8 @@ was or wasn't retrained, and any retrain failure — all leave a trail.
 """
 import json
 import logging
+import logging.handlers
+import os
 import sys
 
 logging.basicConfig(
@@ -17,6 +19,20 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("behaviour")
+
+# Persist EVERYTHING to a plain-text audit file as well as stdout, so a Dockerised run leaves an
+# on-disk trail we can grep after the fact. Attached to the ROOT logger, so the service AND the
+# in-process model (ml.*) both land here. Path is bind-mounted to ./logs on the host; rotated so
+# it never grows unbounded. Never fatal — if the dir isn't writable we just keep stdout.
+_LOG_FILE = os.getenv("BP_LOG_FILE", "/app/logs/behaviour.log")
+try:
+    os.makedirs(os.path.dirname(_LOG_FILE) or ".", exist_ok=True)
+    _fh = logging.handlers.RotatingFileHandler(_LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5)
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logging.getLogger().addHandler(_fh)
+    log.info("audit: file logging -> %s", _LOG_FILE)
+except Exception as e:                       # pragma: no cover
+    log.warning("audit: file log handler not attached (%s) — stdout only", e)
 
 
 def log_event(entity_key, event_type, outcome=None, detail=None,

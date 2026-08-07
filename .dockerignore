@@ -1,0 +1,14 @@
+# Keep the serving image lean and reproducible. Model artifacts are mounted at runtime
+# (-v ./artifacts:/app/artifacts), never baked in; virtualenvs and caches never belong in an image.
+artifacts/
+.venv-ml/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.pytest_cache/
+*.log
+logs/
+behavioral_analysis_data/
+1.md
+.env

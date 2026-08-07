@@ -35,16 +35,18 @@ import webhooks
 
 
 def _payload_from_row(r: dict) -> dict:
-    """Rebuild the exact lean webhook payload /score sends, from the stored decision.
-    bp_decision.fired_rules is JSON [{rule, severity, details}, ...]; the webhook carries
-    only {rule, severity} (same shape as the /score HTTP response)."""
+    """Rebuild a lean webhook payload from the stored decision so a redelivery matches an inline
+    delivery closely. `bp_decision.fired_rules` holds the MODEL's `triggered_signals` — a JSON list
+    of signal STRINGS (e.g. "velocity_burst", "detector:autoencoder"). Older rows may hold the legacy
+    rule-engine shape `[{rule, severity}, ...]`; BOTH are supported so redelivery never crashes on
+    either (this was the `'str' object has no attribute 'get'` bug)."""
     fired = json.loads(r["fired_rules"] or "[]")
-    lean = [{"rule": f.get("rule"), "severity": f.get("severity")} for f in fired]
+    signals = [f.get("rule") if isinstance(f, dict) else f for f in fired]
     return {
         "entity_key": r["entity_key"],
         "transaction_id": r["transaction_id"],
         "decision": r["decision"],
-        "fired_rules": lean,
+        "triggered_signals": signals,
         "judged_against": r["judged_against"],
         "latency_ms": r["latency_ms"],
     }

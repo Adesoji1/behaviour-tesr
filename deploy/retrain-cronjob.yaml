@@ -1,0 +1,70 @@
+# =============================================================================
+# Behavioural Anti-Fraud — Kubernetes CronJobs for the scheduled MLOps jobs.
+#
+#   *** NOT USED IN THE CURRENT DEPLOYMENT — we run docker compose, not Kubernetes,
+#       and retraining is MANUAL for now. This file is kept ONLY as a ready reference
+#       for a future k8s migration. Do not apply it today. ***
+#
+# The docker-compose equivalent (also disabled by default) is deploy/crontab.example.
+# The k8s equivalent of deploy/crontab.example (Practical Rules §3 daily, §4 triggers).
+#
+#   kubectl apply -f deploy/retrain-cronjob.yaml     # ONLY on a future k8s cluster
+#
+# Assumes:
+#   * image `adhere-bf-ml:latest` (the GPU trainer image, Dockerfile.ml) is reachable.
+#   * a Secret `adhere-env` holds STORE_PG_*, PROD_PG_*, BF_*/BP_* (incl. BF_SLACK_WEBHOOK_URL).
+#   * the retrain job runs on a GPU node (nvidia.com/gpu). The monitor job needs NO GPU.
+# Both are SELF-GATING / read-mostly: the retrain promotes only if a trigger fired AND the
+# new model beats the active one; the monitor only reads bp_decision and alerts.
+# =============================================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: behaviour-model-retrain
+  labels: { app: adhere-behaviour, component: retrain }
+spec:
+  schedule: "30 4 * * *"            # 04:30 daily — right after the 04:00 data pull
+  concurrencyPolicy: Forbid         # never overlap two retrains
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 21600   # 6h cap
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: retrain
+              image: adhere-bf-ml:latest
+              command: ["python", "-m", "ml.retrain_trigger", "--run"]
+              envFrom:
+                - secretRef: { name: adhere-env }
+              resources:
+                limits: { nvidia.com/gpu: 1 }
+          # nodeSelector: { gpu: "true" }   # pin to a GPU node if your cluster labels them
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: behaviour-live-monitor
+  labels: { app: adhere-behaviour, component: monitor }
+spec:
+  schedule: "0 * * * *"             # hourly live drift / health watch (no GPU)
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: monitor
+              image: adhere-bf-ml:latest
+              command: ["python", "-m", "ml.monitor", "--live"]
+              envFrom:
+                - secretRef: { name: adhere-env }

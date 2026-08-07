@@ -564,6 +564,91 @@ def status() -> dict:
         store.close()
 
 
+def _post_slack(text: str) -> None:
+    """Post one message to Slack via stdlib urllib (like webhooks.py — no extra dependency).
+    Logs and returns quietly when no webhook is configured. Never raises."""
+    from ml import config as mlcfg
+    url = getattr(mlcfg, "SLACK_WEBHOOK_URL", "")
+    if not url:
+        audit.log.warning("Slack not configured (BF_/BP_SLACK_WEBHOOK_URL) — alert logged only: %s", text)
+        return
+    import json as _json
+    import urllib.request
+    req = urllib.request.Request(url, data=_json.dumps({"text": text}).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    urllib.request.urlopen(req, timeout=5).close()
+
+
+def _alert_once(alert_key: str, signature: str, text: str) -> None:
+    """Slack `text` ONLY when this alert's state CHANGED (edge-triggered de-dup) — so a standing
+    condition is announced ONCE, not on every pull, and deploy.sh + the sync never double-post. The
+    last signature per alert_key lives in bp_alert_state (survives restarts). An empty `text` means a
+    'cleared' state: the signature is updated silently (no Slack) so the alert re-fires if it returns.
+    Never raises — alerting must not affect ingestion."""
+    try:
+        with db.pooled() as conn:
+            cur = db.dict_cursor(conn)
+            cur.execute("SELECT signature FROM bp_alert_state WHERE alert_key=%s", (alert_key,))
+            row = cur.fetchone()
+            if row and row["signature"] == signature:
+                return                      # same state already announced — stay quiet
+            conn.cursor().execute(
+                "INSERT INTO bp_alert_state (alert_key, signature, updated_at) VALUES (%s,%s,now()) "
+                "ON CONFLICT (alert_key) DO UPDATE SET signature=EXCLUDED.signature, updated_at=now()",
+                (alert_key, signature))
+            conn.commit()
+        if text:                            # empty = a cleared state -> update silently, no Slack
+            _post_slack(text)
+    except Exception as e:
+        audit.log.warning("alert-once (%s) failed (non-fatal): %s", alert_key, e)
+
+
+def _check_retrain_due() -> None:
+    """After each pull, evaluate the MODEL-retrain triggers (§4: new-data / age / amount drift) and
+    Slack — ONCE per state change — if a retrain is now due. Detection only (read-only, CPU); the
+    retrain stays the gated MANUAL GPU job. Never raises."""
+    try:
+        from ml import retrain_trigger
+        d = retrain_trigger.evaluate()
+        if d.get("should_retrain"):
+            reasons = "; ".join(d.get("reasons", []))
+            audit.log.warning("retrain DUE — %s", reasons)
+            _alert_once("retrain_due", "due:" + reasons,
+                        ":arrows_counterclockwise: *Behavioural model retrain DUE* — " + reasons +
+                        "\nRetraining is *manual* for now. When ready, on the GPU host run "
+                        "`docker compose --profile train run --rm --entrypoint python trainer "
+                        "-m ml.retrain_trigger --run` (promotes only if it beats the active model), "
+                        "then `curl -X POST http://<service>:8080/reload`.")
+        else:
+            audit.log.info("retrain check: not due — signals=%s", d.get("signals"))
+            _alert_once("retrain_due", "notdue", "")     # clear silently -> re-alerts if it returns
+    except Exception as e:                      # detection must never break ingestion
+        audit.log.warning("retrain check failed (non-fatal): %s", e)
+
+
+def _check_live_drift() -> None:
+    """Automatic live drift / health watch (§9): read the decisions /score wrote to bp_decision and
+    Slack — ONCE per state change — if the flagged rate drifts out of band (over/under-flagging). We
+    call check_live(alert=False) and do our own de-duped Slack (its built-in alert needs httpx, which
+    isn't in this image). Detection only; never retrains, never raises."""
+    try:
+        from ml import monitor
+        st = monitor.check_live(alert=False)
+        problems = st.get("problems") or []
+        if problems:
+            audit.log.warning("live monitor UNHEALTHY — %s", "; ".join(problems))
+            _alert_once("live_drift", "unhealthy:" + "; ".join(sorted(problems)),
+                        ":rotating_light: *Behavioural model looks UNHEALTHY in production* "
+                        f"(flag rate {st.get('flag_rate')}, {st.get('total_decisions')} decisions/"
+                        f"{st.get('window_hours')}h)\n" + "\n".join("• " + p for p in problems) +
+                        "\nLikely data/behaviour drift or a stale model — consider a manual retrain.")
+        else:
+            audit.log.info("live monitor: %s", st.get("note"))
+            _alert_once("live_drift", "healthy", "")     # clear silently
+    except Exception as e:
+        audit.log.warning("live monitor failed (non-fatal): %s", e)
+
+
 def _run_one_sync() -> None:
     """One scheduled ingestion, with the outcome logged. Never raises — the scheduler
     must survive any single failure and try again at the next scheduled time."""
@@ -572,6 +657,8 @@ def _run_one_sync() -> None:
         audit.log.info("sync scheduler run done: %s", {k: out.get(k) for k in
                        ("synced", "new_rows", "refreshed_rows", "pruned_rows",
                         "cache_rows_total", "reason")})
+        _check_retrain_due()   # fresh data landed — is the MODEL now due for a retrain? (§4, de-duped alert)
+        _check_live_drift()    # is the LIVE decision mix drifting out of band? (§9, de-duped alert)
     except Exception as e:                      # never let the loop die
         audit.log.exception("sync scheduler run FAILED (will retry at next scheduled time): %s", e)
 
@@ -593,6 +680,10 @@ def run_forever() -> None:
     for the next time — so ingestion can be paused without stopping the service.
     """
     daily = config.SYNC_AT_HOUR is not None
+    try:                                    # make sure our tables exist (incl. bp_alert_state for
+        db.ensure_schema()                  # de-duped alerts); idempotent + advisory-locked, safe
+    except Exception as e:                  # alongside the API's own ensure_schema.
+        audit.log.warning("sync: ensure_schema failed at start (%s) — continuing", e)
     audit.log.info("sync scheduler START — %s (run_on_start=%s, cap=%s/run, chunk=%s, "
                    "throttle=%.2fs). This is the only production reader.",
                    schedule_description(), config.SYNC_RUN_ON_START,

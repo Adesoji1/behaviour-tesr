@@ -45,3 +45,16 @@ migrate_dumps/
 # Model-response SAMPLE from the production behavioral_analysis table (customer-derived
 # data: amounts, locations). Kept locally for reference, never committed.
 behavioral_analysis_data
+
+# ML training artifacts (models, plots, metrics, feature caches) — derived, large, some
+# customer-derived. The code + requirements are committed; the outputs are not.
+artifacts/
+1.md
+
+.venv-ml/
+
+# BF test payloads — contain a real customer identifier (PII)
+demo/bf_category_tests.txt
+
+# demo payloads contain a real customer identifier (PII)
+demo/*payload*.json
