@@ -79,6 +79,31 @@ ensure_api_key(){
   log "API key: generated and activated (hash stored in bp_api_key; key shown on console only)."
 }
 
+# Production pulls production data on a DAILY schedule (BP_SYNC_AT_HOUR, e.g. 4 = 04:00). If it is
+# unset the sync falls back to INTERVAL mode (every BP_SYNC_INTERVAL_SECONDS) — the initial-backfill
+# mode, NOT what production wants. Verify it so a prod deploy never SILENTLY runs interval pulls.
+# (Pulling ALSO requires this host's IP to be allowlisted on the production Postgres — confirmed in
+# step 1 and verified for real in step 2 below.)
+verify_sync_schedule(){
+  if [ -n "${BP_SYNC_AT_HOUR:-}" ]; then
+    log "Ingestion schedule: DAILY at $(printf '%02d:%02d' "${BP_SYNC_AT_HOUR}" "${BP_SYNC_AT_MINUTE:-0}") ${BP_SYNC_TZ:-UTC} — the production daily pull (BP_SYNC_AT_HOUR set)."
+    return 0
+  fi
+  log "WARNING: BP_SYNC_AT_HOUR is not set — the sync would run in INTERVAL mode (every ${BP_SYNC_INTERVAL_SECONDS:-300}s)."
+  log "         That is the backfill mode, NOT the production daily pull. Production should set"
+  log "         BP_SYNC_AT_HOUR=4 (04:00) in .env so it pulls once a day."
+  if [ -t 0 ]; then
+    read -r -p "Deploy with INTERVAL-mode pulls anyway (not the production schedule)? [y/N] " a
+    case "$a" in
+      y|Y) log "Operator confirmed interval-mode pulls — continuing." ;;
+      *)   fail "stopped — set BP_SYNC_AT_HOUR=4 in .env for the production daily pull, then re-run." ;;
+    esac
+  else
+    [ "${ALLOW_INTERVAL_SYNC:-no}" = "yes" ] \
+      || fail "BP_SYNC_AT_HOUR unset (interval mode). Set it to 4 for production, or pass ALLOW_INTERVAL_SYNC=yes to override."
+  fi
+}
+
 log "================= Behavioural Anti-Fraud deployment ================="
 
 # 1) Server-IP confirmation — prompt on a TTY, else read the env flag.
@@ -96,6 +121,9 @@ PGPASSWORD="${PROD_PG_PASSWORD:-}" PGSSLMODE="${PROD_PG_SSLMODE:-require}" \
   psql -h "$PROD_PG_HOST" -p "${PROD_PG_PORT:-5432}" -U "$PROD_PG_USER" -d "$PROD_PG_DB" \
        -tAc "select 1" >/dev/null || fail "cannot reach production Postgres (IP allowlist / credentials)"
 log "Production Postgres reachable."
+
+# 2b) Verify the production DAILY pull schedule is configured (else stop / require an override).
+verify_sync_schedule
 
 # 3) Promote the LEARNT PROFILES into the production behaviour store (data-only; the
 #    target schema is created by the app's ensure_schema()/schema_pg.sql).

@@ -21,7 +21,18 @@ HERE="$(cd "$(dirname "$0")" && pwd)"        # .../demo
 ROOT="$(cd "$HERE/.." && pwd)"               # repo root (AI-service)
 cd "$ROOT"
 
-PAYLOAD="${1:-$HERE/payload.json}"
+# Payload precedence: explicit arg > your local demo/payload.json (git-ignored; may hold a REAL
+# customer) > the committed demo/payload.example.json (synthetic — so the demo runs on a fresh clone).
+PAYLOAD="${1:-}"
+if [ -z "$PAYLOAD" ]; then
+  if [ -f "$HERE/payload.json" ]; then
+    PAYLOAD="$HERE/payload.json"
+  else
+    PAYLOAD="$HERE/payload.example.json"
+    echo "NOTE: using the committed sample demo/payload.example.json (synthetic values)."
+    echo "      To test a real customer's personal profile: cp demo/payload.example.json demo/payload.json  and edit it (it stays git-ignored)."
+  fi
+fi
 [ -f "$PAYLOAD" ] || { echo "ERROR: payload not found: $PAYLOAD"; exit 1; }
 
 KEY="$(grep '^BP_API_KEY=' .env 2>/dev/null | cut -d= -f2- || true)"

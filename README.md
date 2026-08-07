@@ -781,6 +781,31 @@ webhook arriving at webhook.site; `bp_decision` (`webhook_status=sent`); the ML 
 - **Velocity/bursts** are MODEL features (`vel_1m…vel_24h`, `amt_1h_ratio`, `recency`) computed from
   each customer's recent history at score time — there is no separate velocity engine to run.
 
+### Production data pull — daily 04:00, and the IP allowlist (dev vs prod)
+
+The `sync` service is the **only** process that reads production, and **how often it pulls is one
+switch**, `BP_SYNC_AT_HOUR`:
+
+| Environment | `.env` setting | Behaviour |
+|---|---|---|
+| **Production** | `BP_SYNC_AT_HOUR=4` (**set / uncommented**) | Pulls **once a day at 04:00** (`BP_SYNC_AT_MINUTE`, `BP_SYNC_TZ`). This is the production schedule. |
+| **Development** | `#BP_SYNC_AT_HOUR=4` (**commented**) + `BP_ALLOW_PROD_PULL=0` | **No production pulls** — the master switch stops every live read; `/score` serves from the local cache. (Leaving it only commented falls back to *interval* backfill mode — `BP_SYNC_INTERVAL_SECONDS` — which still pulls; set `BP_ALLOW_PROD_PULL=0` to fully stop.) |
+
+When `BP_SYNC_AT_HOUR` is **unset**, the sync runs in **interval mode** (every
+`BP_SYNC_INTERVAL_SECONDS`) — that is the initial-**backfill** mode, **not** the production daily
+pull. So for production, keep `BP_SYNC_AT_HOUR=4` **active — do not leave it commented/greyed out.**
+
+**Prerequisite for ANY pull (dev or prod): this host's IP must be allowlisted on the production
+Postgres.** Without it every pull fails to connect. This is not automatic — the DB admin adds the
+server's egress IP to the production allowlist first.
+
+**`deploy.sh` enforces both** so a production release can't silently misconfigure the pull:
+1. It **asks** "Has THIS server's IP been allowlisted on the production Postgres?" and then **verifies
+   the connection for real** (`select 1`) — answer no / a failed connect **stops** the deploy.
+2. It **verifies `BP_SYNC_AT_HOUR` is set** (`verify_sync_schedule`): if it's unset (interval mode) the
+   deploy **warns and stops** on a TTY (or requires `ALLOW_INTERVAL_SYNC=yes` unattended), telling the
+   operator to set `BP_SYNC_AT_HOUR=4` — so production never accidentally runs backfill-interval pulls.
+
 ### Real-time velocity — the live-velocity feed (Redis)
 
 Live velocity does **not** fetch from the cache. It has its **own store (Redis)** that `/score` writes
