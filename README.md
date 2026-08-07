@@ -771,9 +771,13 @@ webhook arriving at webhook.site; `bp_decision` (`webhook_status=sent`); the ML 
   (1) **deploy from a host that reaches the store** → nothing pre-built (DB→DB + local `artifacts/`);
   (2) **private bucket** → set `MODEL_BUNDLE_URL`/`STORE_BUNDLE_URL`; `prepare_release.sh` uploads,
   `deploy.sh` fetches them if missing — zero manual copying;
-  (3) **manual** → `scp` the two bundles next to `deploy.sh`. If none is available and the store is
-  empty, deploy.sh **stops** (or needs `ALLOW_COLD_START=yes`) so prod never starts cold.
-  See **[`DEPLOYMENT.md`](DEPLOYMENT.md) §2/§3/§3a**.
+  (3) **manual (no bucket)** → `scp` the two bundles next to `deploy.sh`. **You can't forget how:** if a
+  bundle is missing and no `*_BUNDLE_URL` is set, deploy.sh **prints the exact commands** — `./prepare_release.sh`
+  then a ready-to-paste `scp [-i <key>] model-bundle.tar.gz store-bundle.tar.gz <user>@<server-ip>:<path>/`
+  (fill `DEPLOY_SERVER_IP` / `DEPLOY_SSH_USER` / `DEPLOY_SSH_KEY` in `.env` for an exact line — it
+  auto-detects and notes the `-i <key>` option otherwise, so it covers key **and** password auth).
+  If no transport is available and the store is empty, deploy.sh **stops** (or needs `ALLOW_COLD_START=yes`)
+  so prod never starts cold. See **[`DEPLOYMENT.md`](DEPLOYMENT.md) §2/§3/§3a**.
 - **PostgreSQL 17 client tools are auto-resolved** (`pgtools.sh`): the deploy/dump/backup scripts use the
   host `pg_dump`/`pg_restore` if it's ≥ 17, else they borrow the tools from the running `postgres:17`
   container (`docker exec`) — so a **PG15 laptop still works** while the `db` container is up. If neither
