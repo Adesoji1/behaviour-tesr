@@ -144,10 +144,35 @@ The bundle carries `store-learnt.sql` (profiles + peer baselines, idempotent) an
 when the prod cache is empty** (re-run safe). Ship the bundle securely; **never commit it** (it is
 git-ignored alongside `model-bundle.tar.gz`).
 
-> **Postgres client-tool version:** `pg_dump`/`pg_restore` must be **≥ the store's major version**
-> (this store is **PostgreSQL 17**). A v15 `pg_dump` against a v17 server aborts. `make_store_dump.sh`
-> checks this and fails early with a clear message; make sure the **deploy host** also has the v17
-> client tools so `pg_restore` can read the bundle.
+### PostgreSQL 17 client tools — auto-resolved (host **or** the container)
+
+`pg_dump`/`pg_restore` must be **≥ the store's major version** (the store is **PostgreSQL 17**; a v15
+`pg_dump` against a v17 server aborts). You do **not** have to hand-manage this — `make_store_dump.sh`,
+`deploy.sh` and `backup_store.sh` all resolve the tools automatically (via `pgtools.sh`), in order:
+
+1. **Host client** if `pg_dump` on `PATH` is ≥ 17.
+2. **The `postgres:17` container as the toolbox** — if the host client is older/absent but a store
+   container is running (`docker compose up -d db`), the scripts run the tools inside it
+   (`docker exec`). This is why a PG15 laptop can still build/restore against the v17 store.
+3. Otherwise they point you at **`./install_pg_client.sh`** — it detects your OS (Debian/Ubuntu → PGDG
+   `apt`, RHEL/Fedora/Alma → `dnf`, macOS → Homebrew) and installs the **client-only** package. Preview
+   it with `./install_pg_client.sh --dry-run`; run `--yes` for non-interactive.
+
+The store container (official `postgres:17`) already ships the full client set —
+`psql`, `pg_dump`, `pg_restore`, `pg_basebackup`, `pg_waldump` (the last two live under
+`/usr/lib/postgresql/17/bin/`). Our promotion + `backup_store.sh` use **logical** dumps
+(`pg_dump`/`pg_restore`) because they are per-table, selective, and cross-host — the right granularity
+for shipping the learnt state. **`pg_basebackup`** (physical, whole-cluster, needs replication
+privileges) and **`pg_waldump`** (WAL forensics) are **available but intentionally not wired into the
+scripts** — they are DBA/PITR tools, not what this per-store promotion needs. Nothing here uses
+`pg_restore --clean` (which drops objects); restores are `--data-only`, so a promotion never drops
+anything.
+
+**Full-store backup** (disaster recovery), written via the same resolved tools:
+```bash
+./backup_store.sh            # -> ./backups/store_<ts>.dump  (compressed; git-ignored)
+# restore:  pg_restore --no-owner --data-only -d "$TARGET_DSN"  backups/store_<ts>.dump
+```
 
 ## 4. Start (or confirm) the running stack
 

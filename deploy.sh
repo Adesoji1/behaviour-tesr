@@ -31,6 +31,8 @@
 # =============================================================================
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; cd "$HERE"
+# shellcheck source=pgtools.sh
+. "$HERE/pgtools.sh"          # pg_resolve_tools + pgdump/pgrestore/psqlc (host or postgres:17 container)
 
 LOGDIR="${DEPLOY_LOG_DIR:-./logs}"; mkdir -p "$LOGDIR"
 LOG="$LOGDIR/deploy_$(date +%Y%m%d_%H%M%S).log"
@@ -150,24 +152,31 @@ verify_sync_schedule
 : "${PROD_STORE_DSN:?set PROD_STORE_DSN (production behaviour store)}"
 STORE_BUNDLE="${STORE_BUNDLE:-$HERE/store-bundle.tar.gz}"
 
+# Resolve pg_dump/pg_restore/psql that are >= the store's major (17): host tools if new enough, else a
+# running postgres:17 container as the toolbox (so a PG15 host still works), else advise installing.
+pg_resolve_tools || { pg_tools_hint; fail "no PostgreSQL 17 client tools available for the store promotion"; }
+log "Store tools: ${PG_TOOLS_SRC}."
+
 # helpers -------------------------------------------------------------------------------------------
-_prod_cache_count(){ psql "$PROD_STORE_DSN" -tAc 'SELECT count(*) FROM bp_transactions_cache' 2>/dev/null | tr -dc '0-9'; }
+# NOTE: file inputs go via STDIN (not -f/file-arg) so the tool works the same whether it runs on the
+# host or inside the container (a host file path is not visible inside the container).
+_prod_cache_count(){ psqlc "$PROD_STORE_DSN" -tAc 'SELECT count(*) FROM bp_transactions_cache' 2>/dev/null | tr -dc '0-9'; }
 
 promote_from_dsn(){                                    # transport 1: live DB -> DB
   : "${SRC_STORE_DSN:?set SRC_STORE_DSN (the store holding the learnt profiles + cache)}"
   log "Learnt-state transport: DIRECT DB->DB (SRC_STORE_DSN -> PROD_STORE_DSN)."
   log "Promoting learnt profiles + peer baselines (idempotent; won't overwrite prod's own) ..."
-  pg_dump "$SRC_STORE_DSN" --data-only --no-owner --inserts --on-conflict-do-nothing 2>/dev/null \
-    -t bp_user_behaviour_profile -t bp_peer_baseline \
-    | psql "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 >/dev/null \
+  pgdump "$SRC_STORE_DSN" --data-only --no-owner --inserts --on-conflict-do-nothing \
+    -t bp_user_behaviour_profile -t bp_peer_baseline 2>/dev/null \
+    | psqlc "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 >/dev/null \
     || fail "learnt-profile promotion (pg_dump | psql) failed"
   log "Learnt profiles + peer baselines promoted."
   local n; n="$(_prod_cache_count)"; n="${n:-0}"
   if [ "$n" = "0" ]; then
     log "Seeding transaction cache + sync watermark via COPY (large — the current history) ..."
-    psql "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 -qc 'TRUNCATE bp_sync_state' >/dev/null 2>&1 || true
-    pg_dump "$SRC_STORE_DSN" --data-only --no-owner -t bp_transactions_cache -t bp_sync_state 2>/dev/null \
-      | psql "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 >/dev/null \
+    psqlc "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 -qc 'TRUNCATE bp_sync_state' >/dev/null 2>&1 || true
+    pgdump "$SRC_STORE_DSN" --data-only --no-owner -t bp_transactions_cache -t bp_sync_state 2>/dev/null \
+      | psqlc "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 >/dev/null \
       || fail "cache + watermark seed (pg_dump | psql) failed"
     log "Transaction cache seeded ($(_prod_cache_count) rows) — prod continues from the current history."
   else
@@ -176,13 +185,12 @@ promote_from_dsn(){                                    # transport 1: live DB ->
 }
 
 promote_from_bundle(){                                 # transport 2: store-bundle.tar.gz (out-of-band)
-  command -v pg_restore >/dev/null 2>&1 || fail "pg_restore not found — needed to restore the store bundle"
   log "Learnt-state transport: STORE BUNDLE ${STORE_BUNDLE} (out-of-band file)."
   local work; work="$(mktemp -d)"
   tar xzf "$STORE_BUNDLE" -C "$work" || { rm -rf "$work"; fail "could not extract ${STORE_BUNDLE}"; }
   if [ -f "$work/store-learnt.sql" ]; then
     log "Restoring learnt profiles + peer baselines from bundle (idempotent) ..."
-    psql "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 -q -f "$work/store-learnt.sql" >/dev/null \
+    psqlc "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 -q < "$work/store-learnt.sql" >/dev/null \
       || { rm -rf "$work"; fail "learnt-profile restore (psql) failed"; }
     log "Learnt profiles + peer baselines restored."
   else
@@ -192,8 +200,8 @@ promote_from_bundle(){                                 # transport 2: store-bund
   if [ "$n" = "0" ]; then
     if [ -f "$work/store-cache.dump" ]; then
       log "Restoring transaction cache + sync watermark from bundle (COPY) ..."
-      psql "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 -qc 'TRUNCATE bp_sync_state' >/dev/null 2>&1 || true
-      pg_restore --no-owner --data-only -d "$PROD_STORE_DSN" "$work/store-cache.dump" >/dev/null 2>&1 \
+      psqlc "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 -qc 'TRUNCATE bp_sync_state' >/dev/null 2>&1 || true
+      pgrestore --no-owner --data-only -d "$PROD_STORE_DSN" < "$work/store-cache.dump" >/dev/null 2>&1 \
         || { rm -rf "$work"; fail "cache restore (pg_restore) failed"; }
       log "Transaction cache restored ($(_prod_cache_count) rows) — prod continues from the current history."
     else

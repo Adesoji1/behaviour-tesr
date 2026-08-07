@@ -70,3 +70,5 @@ store-bundle.tar.gz
 store-learnt.sql
 store-cache.dump
 *.dump
+# local store backups (backup_store.sh) — full customer data
+backups/

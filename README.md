@@ -770,6 +770,13 @@ webhook arriving at webhook.site; `bp_decision` (`webhook_status=sent`); the ML 
   **`./make_store_dump.sh`** → `store-bundle.tar.gz`, `scp` it next to `deploy.sh`, and step 3 restores
   it. If neither is provided and the prod store is empty, deploy.sh **stops** (or needs
   `ALLOW_COLD_START=yes` unattended) so prod never starts cold. See **[`DEPLOYMENT.md`](DEPLOYMENT.md) §3/§3a**.
+- **PostgreSQL 17 client tools are auto-resolved** (`pgtools.sh`): the deploy/dump/backup scripts use the
+  host `pg_dump`/`pg_restore` if it's ≥ 17, else they borrow the tools from the running `postgres:17`
+  container (`docker exec`) — so a **PG15 laptop still works** while the `db` container is up. If neither
+  exists, **`./install_pg_client.sh`** installs the client for your OS (`--dry-run` to preview). Full-store
+  backups: **`./backup_store.sh`** → `./backups/*.dump` (git-ignored). The store container also carries
+  `pg_basebackup`/`pg_waldump`, but the scripts deliberately use **logical** dumps (right granularity;
+  never `--clean`, so a restore never drops data).
 - **The model is shipped OUT-OF-BAND, never in git** — the model files contain customer-derived
   identifiers, beneficiary account numbers and IP subnets, so the repo carries **code +
   `schema_pg.sql`** only. On a host that has the trained `artifacts/` (build/operator host), `deploy.sh`
