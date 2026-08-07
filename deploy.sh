@@ -60,6 +60,32 @@ _fetch(){ # _fetch <url> <dest>
   esac
 }
 
+# Best-effort discovery of THIS server's address + ssh identity, so the "how to copy it here" help is
+# copy-paste ready. Override any of them with DEPLOY_SERVER_IP / DEPLOY_SSH_USER / DEPLOY_SSH_KEY.
+_server_ip(){
+  [ -n "${DEPLOY_SERVER_IP:-}" ] && { echo "$DEPLOY_SERVER_IP"; return; }
+  local ip; ip="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"; [ -n "$ip" ] && { echo "$ip"; return; }
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"; [ -n "$ip" ] && { echo "$ip"; return; }
+  echo "<THIS_SERVER_IP>"
+}
+_ssh_user(){ echo "${DEPLOY_SSH_USER:-${SUDO_USER:-${USER:-<user>}}}"; }
+
+# When a bundle is missing AND no bucket URL is set, print the EXACT commands to build it on a
+# store-reachable host (your laptop) and scp it onto THIS server — so it can never be forgotten.
+bundle_transfer_help(){                       # $1 = file(s), e.g. "model-bundle.tar.gz store-bundle.tar.gz"
+  local files="$1" ip user key=""
+  ip="$(_server_ip)"; user="$(_ssh_user)"
+  [ -n "${DEPLOY_SSH_KEY:-}" ] && key=" -i ${DEPLOY_SSH_KEY}"
+  log "  ---- how to get ${files} onto THIS server (no *_BUNDLE_URL bucket configured) ----"
+  log "  On the machine that has the trained model AND can reach the store (e.g. your laptop),"
+  log "  from the AI-service checkout:"
+  log "    1) build:   ./prepare_release.sh"
+  log "    2) copy :   scp${key} ${files} ${user}@${ip}:${HERE}/"
+  [ -z "${DEPLOY_SSH_KEY:-}" ] && log "        (key auth? add  -i /path/to/key.pem  right after 'scp')"
+  log "    3) here :   re-run  ./deploy.sh"
+  log "  (Or set STORE_BUNDLE_URL / MODEL_BUNDLE_URL to a PRIVATE bucket for automatic fetch — no copy.)"
+}
+
 # load .env if present (so PROD_* / *_DSN / BP_API_KEY come from there)
 [ -f .env ] && { set -a; . ./.env; set +a; }
 
@@ -246,8 +272,8 @@ else
   else
     log "No learnt-state transport: SRC_STORE_DSN is unset AND no store bundle at ${STORE_BUNDLE},"
     log "and production's store is EMPTY. Production would start COLD (no history for velocity/retrain)."
-    log "Fix: build a bundle on a host that can reach your store — ./make_store_dump.sh — scp"
-    log "store-bundle.tar.gz next to deploy.sh, and re-run; OR set SRC_STORE_DSN for a direct DB->DB pipe."
+    bundle_transfer_help "store-bundle.tar.gz model-bundle.tar.gz"
+    log "(Or set SRC_STORE_DSN for a direct DB->DB pipe if this host can reach the store.)"
     if [ -t 0 ]; then
       read -r -p "Continue with a COLD production store anyway? [y/N] " a
       case "$a" in y|Y) log "Operator confirmed a cold start — continuing." ;;
@@ -279,8 +305,9 @@ elif [ -d artifacts/models ] && [ -n "$(ls -A artifacts/models 2>/dev/null)" ]; 
   log "No model bundle at ${MODEL_BUNDLE} — using the models already present in ./artifacts/models."
 else
   log "WARNING: no model bundle at ${MODEL_BUNDLE} and ./artifacts/models is empty — /score would have"
-  log "         no model to load. Transfer the out-of-band model bundle here (or set MODEL_BUNDLE), or"
-  log "         run a training job:  docker compose --profile train run --rm trainer --promote"
+  log "         no model to load."
+  bundle_transfer_help "model-bundle.tar.gz"
+  log "  (Or, on a GPU host, train one here:  docker compose --profile train run --rm trainer --promote)"
 fi
 
 # 4) Promote the VALIDATED MODEL artifacts + registry to the serving host.

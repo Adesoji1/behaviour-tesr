@@ -97,9 +97,13 @@ carries **code + `schema_pg.sql`** only.
    `STORE_BUNDLE_URL` (an `s3://`/`gs://` bucket) in `.env`. `prepare_release.sh` **uploads** the
    bundles; `deploy.sh` **fetches** them automatically if they aren't local. Nothing to scp, nothing to
    remember. (Use a **private** bucket — this is customer data.)
-3. **Manual copy:** `scp model-bundle.tar.gz store-bundle.tar.gz` next to `deploy.sh` (or point
-   `MODEL_BUNDLE=` / `STORE_BUNDLE=` at them). `deploy.sh` unpacks the model (step 3b) and restores the
-   store (step 3).
+3. **Manual copy (no bucket):** `scp model-bundle.tar.gz store-bundle.tar.gz` next to `deploy.sh` (or
+   point `MODEL_BUNDLE=` / `STORE_BUNDLE=` at them). `deploy.sh` unpacks the model (step 3b) and
+   restores the store (step 3). **You can't forget this:** if a bundle is missing and no
+   `*_BUNDLE_URL` is set, `deploy.sh` **prints the exact commands** to run — `./prepare_release.sh` on
+   your laptop, then a ready-to-paste `scp … <user>@<server-ip>:<path>/` line. Set `DEPLOY_SERVER_IP`,
+   `DEPLOY_SSH_USER`, and (for key auth) `DEPLOY_SSH_KEY` in `.env` so that `scp` line is filled in
+   exactly (they auto-detect otherwise, and a note reminds you to add `-i <key>` for key auth).
 
 ## 3. Run the deploy
 
