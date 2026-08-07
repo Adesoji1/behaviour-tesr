@@ -757,10 +757,13 @@ webhook arriving at webhook.site; `bp_decision` (`webhook_status=sent`); the ML 
 **Step-by-step runbook: [`DEPLOYMENT.md`](DEPLOYMENT.md)** (what the operator does, in order).
 
 - **`./deploy.sh`** — operator-run. Confirms the server IP (prompts on a TTY, else
-  `PROD_IP_ALLOWLISTED=yes`), **verifies the production Postgres connection directly**, promotes the
-  learnt **profiles** into the production behaviour store, **unpacks the out-of-band model bundle**
-  if present (step 3b), promotes the validated **model artifacts + registry**, then checks `/health`.
-  Logs everything to `./logs/deploy_*.log`; reports to Slack.
+  `PROD_IP_ALLOWLISTED=yes`), **verifies the production Postgres connection directly**, checks the
+  daily-pull schedule is set, promotes the **learnt state** into the production behaviour store —
+  the learnt profiles + peer baselines **and** the transaction cache + sync watermark, so **prod
+  continues from the current behaviour and the 4am pull only adds the delta** — **unpacks the
+  out-of-band model bundle** if present (step 3b), promotes the validated **model artifacts +
+  registry**, then checks `/health`. Logs to `./logs/deploy_*.log`; reports to Slack. All data moves
+  **DB→DB / out-of-band — nothing customer-derived is ever committed to git.**
 - **The model is shipped OUT-OF-BAND, never in git** — the model files contain customer-derived
   identifiers, beneficiary account numbers and IP subnets, so the repo carries **code +
   `schema_pg.sql`** only. On a host that has the trained `artifacts/` (build/operator host), `deploy.sh`

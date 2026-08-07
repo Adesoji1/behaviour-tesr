@@ -97,9 +97,15 @@ What it does, in order (and logs to `./logs/deploy_*.log`):
    set `PROD_IP_ALLOWLISTED=yes`. Answer **no** → it stops, nothing changed.
 2. **Verifies the production Postgres connection directly** (`select 1`) — the real gate, not just
    the confirmation. Fails → stops with a Slack alert.
-3. **Promotes the learnt profiles** into the production behaviour store (`pg_dump --data-only` of
-   `bp_user_behaviour_profile`, `bp_peer_baseline`, `bp_sync_state`) — so **production starts from
-   the learnt state, not from zero**.
+3. **Promotes the learnt state** into the production behaviour store — direct DB→DB, so **production
+   continues from the current learnt behaviour and the daily pull only adds the delta**:
+   - **(a)** the learnt `bp_user_behaviour_profile` + `bp_peer_baseline` — idempotent
+     (`INSERT … ON CONFLICT DO NOTHING`, so a re-run never clobbers profiles prod learned itself);
+   - **(b)** the raw `bp_transactions_cache` (the ~1.3 GB history the model uses for velocity +
+     retraining) **plus** `bp_sync_state` (the watermark) — seeded by fast **COPY** **only when the
+     prod cache is empty**, so cache and watermark stay consistent and a re-run never duplicates it.
+   Needs `SRC_STORE_DSN` (the store holding the learnt profiles + cache) → `PROD_STORE_DSN`
+   connectivity. (Everything is DB→DB / out-of-band — **no customer data is ever committed to git**.)
 3b. **Unpacks the model bundle** if one is present (`MODEL_BUNDLE`, default `./model-bundle.tar.gz`)
    into `./artifacts` — the out-of-band way to get the model onto a host that only has a git clone
    (see §2). Skipped when `artifacts/models` is already populated.

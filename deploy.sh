@@ -125,16 +125,42 @@ log "Production Postgres reachable."
 # 2b) Verify the production DAILY pull schedule is configured (else stop / require an override).
 verify_sync_schedule
 
-# 3) Promote the LEARNT PROFILES into the production behaviour store (data-only; the
-#    target schema is created by the app's ensure_schema()/schema_pg.sql).
-: "${SRC_STORE_DSN:?set SRC_STORE_DSN (store holding the learnt profiles)}"
+# 3) Promote the LEARNT STATE into the production behaviour store, so production CONTINUES from the
+#    current learnt behaviour instead of starting cold — and the daily 04:00 pull then only ADDS the
+#    delta on top. All direct DB->DB (out-of-band; NOTHING here is committed to git). The target
+#    schema is created by the app's ensure_schema()/schema_pg.sql. Two parts:
+#      (a) the SMALL learnt tables — idempotent (INSERT ... ON CONFLICT DO NOTHING), safe on re-run
+#          and it never clobbers profiles production has since learned on its own;
+#      (b) the LARGE transaction cache + the sync WATERMARK — fast COPY, seeded ONLY when the prod
+#          cache is empty (so a re-run never duplicates it). The cache and bp_sync_state are moved
+#          TOGETHER so the watermark stays consistent with the history and the next pull continues
+#          cleanly (pulls only new rows, not a full re-fetch). The cache is what the model uses for
+#          velocity features and for retraining, so without it prod would be cold.
+: "${SRC_STORE_DSN:?set SRC_STORE_DSN (store holding the learnt profiles + transaction cache)}"
 : "${PROD_STORE_DSN:?set PROD_STORE_DSN (production behaviour store)}"
-log "Promoting learnt behaviour profiles -> production behaviour store ..."
-pg_dump "$SRC_STORE_DSN" --data-only --no-owner --on-conflict-do-nothing 2>/dev/null \
-  -t bp_user_behaviour_profile -t bp_peer_baseline -t bp_sync_state \
+
+log "Promoting learnt profiles + peer baselines -> production (idempotent; won't overwrite prod's own) ..."
+pg_dump "$SRC_STORE_DSN" --data-only --no-owner --inserts --on-conflict-do-nothing 2>/dev/null \
+  -t bp_user_behaviour_profile -t bp_peer_baseline \
   | psql "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 >/dev/null \
-  || fail "profile promotion (pg_dump | psql) failed"
-log "Profiles promoted (production starts from the learnt state, not from zero)."
+  || fail "learnt-profile promotion (pg_dump | psql) failed"
+log "Learnt profiles + peer baselines promoted."
+
+# (b) Seed the raw transaction CACHE + sync watermark — ONLY when production's cache is empty, so the
+#     history and the watermark stay consistent and a re-run never duplicates ~1.3 GB. Fast COPY.
+PROD_CACHE_N="$(psql "$PROD_STORE_DSN" -tAc 'SELECT count(*) FROM bp_transactions_cache' 2>/dev/null || echo 0)"
+PROD_CACHE_N="$(printf '%s' "$PROD_CACHE_N" | tr -dc '0-9')"; PROD_CACHE_N="${PROD_CACHE_N:-0}"
+if [ "$PROD_CACHE_N" = "0" ]; then
+  log "Seeding production transaction cache + sync watermark via COPY (large — the current history) ..."
+  pg_dump "$SRC_STORE_DSN" --data-only --no-owner -t bp_transactions_cache -t bp_sync_state 2>/dev/null \
+    | psql "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 >/dev/null \
+    || fail "cache + watermark seed (pg_dump | psql) failed"
+  SEEDED_N="$(psql "$PROD_STORE_DSN" -tAc 'SELECT count(*) FROM bp_transactions_cache' 2>/dev/null | tr -dc '0-9')"
+  log "Transaction cache seeded (${SEEDED_N:-?} rows) — production continues from the current history; the daily pull adds only the delta."
+else
+  log "Production cache already has ${PROD_CACHE_N} rows — leaving cache + watermark untouched (re-run safe). The daily pull keeps it current."
+fi
+log "Learnt state promoted (production starts warm, not from zero)."
 
 # 3b) Unpack the MODEL BUNDLE if present. The trained model + registry are shipped OUT-OF-BAND
 #     (never committed to git — the model files contain customer-derived identifiers, beneficiary
