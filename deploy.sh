@@ -47,6 +47,19 @@ slack(){ [ -n "${BP_SLACK_WEBHOOK_URL:-}" ] && curl -s -X POST -H 'Content-type:
            --data "{\"text\":\"$(printf '%s' "$1" | sed 's/"/\\"/g')\"}" "$BP_SLACK_WEBHOOK_URL" >/dev/null 2>&1 || true; }
 fail(){ log "ERROR: $*"; slack ":x: Behavioural deploy FAILED — $*"; exit 1; }
 
+# Fetch an OUT-OF-BAND bundle from a private object store (NEVER git) when it isn't already local.
+# Lets a disconnected deploy host auto-pull the model/store bundles so nothing must be scp'd by hand.
+_fetch(){ # _fetch <url> <dest>
+  local url="$1" dest="$2"
+  case "$url" in
+    s3://*)   command -v aws    >/dev/null 2>&1 || { log "aws cli not found for $url"; return 1; }; aws s3 cp "$url" "$dest" ;;
+    gs://*)   command -v gsutil >/dev/null 2>&1 || { log "gsutil not found for $url"; return 1; }; gsutil cp "$url" "$dest" ;;
+    http://*|https://*) command -v curl >/dev/null 2>&1 || { log "curl not found for $url"; return 1; }; curl -fSL -o "$dest" "$url" ;;
+    file://*) cp "${url#file://}" "$dest" ;;
+    *) log "unsupported bundle URL scheme: $url"; return 1 ;;
+  esac
+}
+
 # load .env if present (so PROD_* / *_DSN / BP_API_KEY come from there)
 [ -f .env ] && { set -a; . ./.env; set +a; }
 
@@ -213,6 +226,13 @@ promote_from_bundle(){                                 # transport 2: store-bund
   rm -rf "$work"
 }
 
+# If the bundle isn't local but a URL is configured (private object store), fetch it — so a
+# disconnected host needs no manual scp. Build+upload with ./prepare_release.sh (STORE_BUNDLE_URL).
+if [ ! -f "$STORE_BUNDLE" ] && [ -n "${STORE_BUNDLE_URL:-}" ]; then
+  log "Store bundle not local — fetching from ${STORE_BUNDLE_URL} ..."
+  _fetch "$STORE_BUNDLE_URL" "$STORE_BUNDLE" || fail "could not fetch store bundle from ${STORE_BUNDLE_URL}"
+fi
+
 if [ -f "$STORE_BUNDLE" ]; then
   promote_from_bundle
 elif [ -n "${SRC_STORE_DSN:-}" ]; then
@@ -247,6 +267,10 @@ log "Learnt state promotion done (production starts warm, not from zero)."
 #     the ACTIVE and the PREVIOUS model, so registry.rollback() works out of the box. Idempotent;
 #     skipped when no bundle is present (e.g. artifacts/ is already populated on this host).
 MODEL_BUNDLE="${MODEL_BUNDLE:-$HERE/model-bundle.tar.gz}"
+if [ ! -f "$MODEL_BUNDLE" ] && [ -n "${MODEL_BUNDLE_URL:-}" ]; then
+  log "Model bundle not local — fetching from ${MODEL_BUNDLE_URL} ..."
+  _fetch "$MODEL_BUNDLE_URL" "$MODEL_BUNDLE" || fail "could not fetch model bundle from ${MODEL_BUNDLE_URL}"
+fi
 if [ -f "$MODEL_BUNDLE" ]; then
   log "Unpacking model bundle ${MODEL_BUNDLE} -> ./artifacts ..."
   tar xzf "$MODEL_BUNDLE" -C "$HERE" || fail "could not extract model bundle ${MODEL_BUNDLE}"

@@ -764,12 +764,16 @@ webhook arriving at webhook.site; `bp_decision` (`webhook_status=sent`); the ML 
   out-of-band model bundle** if present (step 3b), promotes the validated **model artifacts +
   registry**, then checks `/health`. Logs to `./logs/deploy_*.log`; reports to Slack. All data moves
   **out-of-band — nothing customer-derived is ever committed to git.**
-- **Two ways the learnt state reaches production** (deploy.sh auto-detects; the bundle wins if both):
-  (1) **direct DB→DB** — set `SRC_STORE_DSN` (reachable) + `PROD_STORE_DSN`, deploy.sh pipes it live;
-  (2) **store bundle** — when the two DBs can't talk directly (e.g. you build it on your PC): run
-  **`./make_store_dump.sh`** → `store-bundle.tar.gz`, `scp` it next to `deploy.sh`, and step 3 restores
-  it. If neither is provided and the prod store is empty, deploy.sh **stops** (or needs
-  `ALLOW_COLD_START=yes` unattended) so prod never starts cold. See **[`DEPLOYMENT.md`](DEPLOYMENT.md) §3/§3a**.
+- **Nothing to forget before a deploy** — `./prepare_release.sh` builds **both** out-of-band bundles in
+  one step: `model-bundle.tar.gz` (active + previous model) and `store-bundle.tar.gz` (learnt state).
+  Neither can live in git (customer data; the store dump also exceeds GitHub's 100 MB limit).
+- **Three ways they reach production** (pick what your network allows; deploy.sh auto-detects):
+  (1) **deploy from a host that reaches the store** → nothing pre-built (DB→DB + local `artifacts/`);
+  (2) **private bucket** → set `MODEL_BUNDLE_URL`/`STORE_BUNDLE_URL`; `prepare_release.sh` uploads,
+  `deploy.sh` fetches them if missing — zero manual copying;
+  (3) **manual** → `scp` the two bundles next to `deploy.sh`. If none is available and the store is
+  empty, deploy.sh **stops** (or needs `ALLOW_COLD_START=yes`) so prod never starts cold.
+  See **[`DEPLOYMENT.md`](DEPLOYMENT.md) §2/§3/§3a**.
 - **PostgreSQL 17 client tools are auto-resolved** (`pgtools.sh`): the deploy/dump/backup scripts use the
   host `pg_dump`/`pg_restore` if it's ≥ 17, else they borrow the tools from the running `postgres:17`
   container (`docker exec`) — so a **PG15 laptop still works** while the `db` container is up. If neither

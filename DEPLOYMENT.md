@@ -33,9 +33,20 @@ gate, order, verify). For a plain local dev run, `docker compose up -d` is fine;
 - A **production behaviour store** (PostgreSQL) reachable from the host — this is where the learnt
   profiles are promoted to. (Separate from the read-only production *source* DB, `PROD_PG_*`.)
 - This host's **public IP allowlisted** on the production source Postgres (the sync job reads it).
+- **PostgreSQL 17 client tools** for the store promotion/backup (`pg_dump`/`pg_restore` must be ≥ the
+  store's major). You usually don't need to do anything — the scripts borrow the tools from the running
+  `postgres:17` container automatically. **If** the store is a *managed* Postgres (no local container)
+  and this host's client is old/absent, install them **first**:
+  ```bash
+  ./install_pg_client.sh --dry-run     # preview what it will do for your OS
+  ./install_pg_client.sh               # detects OS -> installs the client-only PostgreSQL 17 package
+  ```
+- **The model + store are shipped OUT-OF-BAND, never in git** (they hold customer data; the store dump
+  also exceeds GitHub's 100 MB file limit). Build them with `./prepare_release.sh` (see §2) — the repo
+  carries only code + `schema_pg.sql`.
 - **Make the shell scripts executable** (a fresh checkout may not carry the bit):
   ```bash
-  chmod +x deploy.sh watchdog.sh pg_migrate_store.sh
+  chmod +x deploy.sh watchdog.sh make_store_dump.sh backup_store.sh install_pg_client.sh prepare_release.sh
   ```
   `deploy.sh` also re-applies `+x` to `watchdog.sh` at the end, but set it here so `./deploy.sh`
   itself runs.
@@ -64,28 +75,31 @@ docker compose --profile train run --rm trainer --promote
 It promotes the new model **only if it beats the current active** on the synthetic-anomaly AUC.
 Confirm: `python -m ml.monitor` (or check `artifacts/registry/index.json` has an `active` version).
 
-### The model is shipped OUT-OF-BAND — never in git
+### The model + store are shipped OUT-OF-BAND — never in git
 
-The trained model files (`artifacts/models/<version>/featurebuilder.joblib`, …) contain
-**customer-derived data** — per-customer identifiers, their beneficiary account numbers and IP
-subnets — so they are **git-ignored and must never be committed** (zipping them does not change
-that; the data is still inside). The git repo carries the **code + `schema_pg.sql`** only.
+The trained model files (`artifacts/models/<version>/featurebuilder.joblib`, …) and the store dump
+contain **customer-derived data** — identifiers, beneficiary account numbers, IPs, full transaction
+history — so they are **git-ignored and must never be committed** (zipping does not redact them; and
+the store dump exceeds GitHub's 100 MB file limit, so a push would be rejected anyway). The git repo
+carries **code + `schema_pg.sql`** only.
 
-Two ways the model reaches production, both PII-safe:
+**One command builds everything you need for a deploy** (so nothing is forgotten):
+```bash
+./prepare_release.sh          # -> model-bundle.tar.gz  +  store-bundle.tar.gz   (both git-ignored)
+```
+`model-bundle.tar.gz` = the **active + previous** model dirs + `registry/index.json` (so
+`registry.rollback()` works immediately). `store-bundle.tar.gz` = the learnt state (see §3).
 
-- **From the build/operator host (default):** `deploy.sh` rsyncs your local `artifacts/models` +
-  `artifacts/registry` to the serving host (step 4). Nothing to prepare.
-- **Deploying on a host that only has a git clone** (empty `artifacts/`): ship a **model bundle** and
-  let `deploy.sh` unpack it. Build the bundle once on a host that has the models:
-  ```bash
-  tar czf model-bundle.tar.gz \
-      artifacts/models/<active-version> artifacts/models/<previous-version> artifacts/registry/index.json
-  ```
-  Transfer `model-bundle.tar.gz` **out-of-band** (scp / secure bucket) to the deploy host, next to
-  `deploy.sh` (or point `MODEL_BUNDLE=/path/to/model-bundle.tar.gz` at it). `deploy.sh` extracts it
-  into `./artifacts` (step 3b) so the models land in `artifacts/models/` exactly as
-  `registry/index.json` expects. Include **both the active and the previous** model so
-  `registry.rollback()` works immediately.
+**Getting them to production — three ways, no manual step forgotten:**
+1. **Deploy from a host that can reach the store** (e.g. your PC): you need **nothing pre-built** —
+   `deploy.sh` promotes the store DB→DB and rsyncs the local `artifacts/`. This is the simplest path.
+2. **Private object store (recommended for a disconnected deploy host):** set `MODEL_BUNDLE_URL` /
+   `STORE_BUNDLE_URL` (an `s3://`/`gs://` bucket) in `.env`. `prepare_release.sh` **uploads** the
+   bundles; `deploy.sh` **fetches** them automatically if they aren't local. Nothing to scp, nothing to
+   remember. (Use a **private** bucket — this is customer data.)
+3. **Manual copy:** `scp model-bundle.tar.gz store-bundle.tar.gz` next to `deploy.sh` (or point
+   `MODEL_BUNDLE=` / `STORE_BUNDLE=` at them). `deploy.sh` unpacks the model (step 3b) and restores the
+   store (step 3).
 
 ## 3. Run the deploy
 
