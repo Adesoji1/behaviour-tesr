@@ -60,3 +60,13 @@ demo/bf_category_tests.txt
 demo/*payload*.json
 # ...but keep the SANITISED template (synthetic values only) so the demo is self-contained.
 !demo/payload.example.json
+
+# ============================================================================
+# OUT-OF-BAND transfer bundles — the trained model and the store dump. These hold
+# customer-derived data; ship them securely (scp / secure bucket), NEVER commit.
+# ============================================================================
+model-bundle.tar.gz
+store-bundle.tar.gz
+store-learnt.sql
+store-cache.dump
+*.dump

@@ -97,21 +97,57 @@ What it does, in order (and logs to `./logs/deploy_*.log`):
    set `PROD_IP_ALLOWLISTED=yes`. Answer **no** → it stops, nothing changed.
 2. **Verifies the production Postgres connection directly** (`select 1`) — the real gate, not just
    the confirmation. Fails → stops with a Slack alert.
-3. **Promotes the learnt state** into the production behaviour store — direct DB→DB, so **production
-   continues from the current learnt behaviour and the daily pull only adds the delta**:
+3. **Promotes the learnt state** into the production behaviour store, so **production continues from
+   the current learnt behaviour and the daily pull only adds the delta**. Two parts either way:
    - **(a)** the learnt `bp_user_behaviour_profile` + `bp_peer_baseline` — idempotent
      (`INSERT … ON CONFLICT DO NOTHING`, so a re-run never clobbers profiles prod learned itself);
    - **(b)** the raw `bp_transactions_cache` (the ~1.3 GB history the model uses for velocity +
-     retraining) **plus** `bp_sync_state` (the watermark) — seeded by fast **COPY** **only when the
-     prod cache is empty**, so cache and watermark stay consistent and a re-run never duplicates it.
-   Needs `SRC_STORE_DSN` (the store holding the learnt profiles + cache) → `PROD_STORE_DSN`
-   connectivity. (Everything is DB→DB / out-of-band — **no customer data is ever committed to git**.)
+     retraining) **plus** `bp_sync_state` (the watermark) — seeded **only when the prod cache is
+     empty**, so cache and watermark stay consistent and a re-run never duplicates it.
+
+   **Two transports — deploy.sh auto-detects (see §3a); provide ONE:**
+   - **Direct DB→DB pipe** — set `SRC_STORE_DSN` (reachable from the deploy host) + `PROD_STORE_DSN`;
+     deploy.sh pipes it live (`pg_dump | psql`).
+   - **Store bundle file** — when the two DBs **can't talk directly** (e.g. you build it on your PC):
+     run `./make_store_dump.sh` to produce `store-bundle.tar.gz`, `scp` it next to `deploy.sh` (or set
+     `STORE_BUNDLE=/path`), and deploy.sh restores from the file. **The bundle wins if both are set.**
+
+   (Everything is out-of-band — **no customer data is ever committed to git**; the bundle is
+   git-ignored.) If neither transport is provided **and** the prod store is empty, deploy.sh stops
+   (or, unattended, needs `ALLOW_COLD_START=yes`) so production never silently starts cold.
 3b. **Unpacks the model bundle** if one is present (`MODEL_BUNDLE`, default `./model-bundle.tar.gz`)
    into `./artifacts` — the out-of-band way to get the model onto a host that only has a git clone
    (see §2). Skipped when `artifacts/models` is already populated.
 4. **Promotes the validated model** artifacts + registry (`PROD_ARTIFACTS_DEST`, or a shared volume).
 5. **Checks `/health`** — the service is up and answering.
 6. Reports success/failure to Slack.
+
+### 3a. If the two databases can't talk — build a store bundle on your PC
+
+Use this when the **deploy host can't reach your behaviour store** (so the direct DB→DB pipe isn't
+possible) — for example you're on your own PC and production is elsewhere. It's a **dump once → scp →
+restore** flow, and `deploy.sh` handles the restore automatically.
+
+```bash
+# 1) On a machine that CAN reach your store (reads SRC_STORE_DSN from .env, or pass a DSN):
+./make_store_dump.sh                      # -> ./store-bundle.tar.gz  (learnt profiles + cache + watermark)
+
+# 2) Copy it to the deploy host, next to deploy.sh (it is git-ignored — it holds customer data):
+scp store-bundle.tar.gz  operator@deploy-host:/opt/adhere/AI-service/
+
+# 3) On the deploy host, just run the normal deploy — step 3 detects the bundle and restores it:
+./deploy.sh
+```
+
+The bundle carries `store-learnt.sql` (profiles + peer baselines, idempotent) and `store-cache.dump`
+(cache + watermark, compressed). `deploy.sh` restores the profiles idempotently and the cache **only
+when the prod cache is empty** (re-run safe). Ship the bundle securely; **never commit it** (it is
+git-ignored alongside `model-bundle.tar.gz`).
+
+> **Postgres client-tool version:** `pg_dump`/`pg_restore` must be **≥ the store's major version**
+> (this store is **PostgreSQL 17**). A v15 `pg_dump` against a v17 server aborts. `make_store_dump.sh`
+> checks this and fails early with a clear message; make sure the **deploy host** also has the v17
+> client tools so `pg_restore` can read the bundle.
 
 ## 4. Start (or confirm) the running stack
 

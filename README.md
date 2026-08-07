@@ -763,7 +763,13 @@ webhook arriving at webhook.site; `bp_decision` (`webhook_status=sent`); the ML 
   continues from the current behaviour and the 4am pull only adds the delta** — **unpacks the
   out-of-band model bundle** if present (step 3b), promotes the validated **model artifacts +
   registry**, then checks `/health`. Logs to `./logs/deploy_*.log`; reports to Slack. All data moves
-  **DB→DB / out-of-band — nothing customer-derived is ever committed to git.**
+  **out-of-band — nothing customer-derived is ever committed to git.**
+- **Two ways the learnt state reaches production** (deploy.sh auto-detects; the bundle wins if both):
+  (1) **direct DB→DB** — set `SRC_STORE_DSN` (reachable) + `PROD_STORE_DSN`, deploy.sh pipes it live;
+  (2) **store bundle** — when the two DBs can't talk directly (e.g. you build it on your PC): run
+  **`./make_store_dump.sh`** → `store-bundle.tar.gz`, `scp` it next to `deploy.sh`, and step 3 restores
+  it. If neither is provided and the prod store is empty, deploy.sh **stops** (or needs
+  `ALLOW_COLD_START=yes` unattended) so prod never starts cold. See **[`DEPLOYMENT.md`](DEPLOYMENT.md) §3/§3a**.
 - **The model is shipped OUT-OF-BAND, never in git** — the model files contain customer-derived
   identifiers, beneficiary account numbers and IP subnets, so the repo carries **code +
   `schema_pg.sql`** only. On a host that has the trained `artifacts/` (build/operator host), `deploy.sh`

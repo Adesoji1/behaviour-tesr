@@ -13,8 +13,13 @@
 #
 # Required env (usually from .env):
 #   PROD_PG_HOST/PORT/USER/PROD_PG_PASSWORD/PROD_PG_DB [/PROD_PG_SSLMODE]
-#   SRC_STORE_DSN     libpq DSN of the store holding the learnt profiles (staging/local)
 #   PROD_STORE_DSN    libpq DSN of the PRODUCTION behaviour store (target)
+# Learnt-state transport (step 3) — provide ONE of these (bundle wins if both exist):
+#   SRC_STORE_DSN     libpq DSN of the store holding the learnt profiles + cache (DIRECT DB->DB pipe;
+#                     needs the source reachable from THIS host), OR
+#   STORE_BUNDLE      path to a store-bundle.tar.gz built by ./make_store_dump.sh (default
+#                     ./store-bundle.tar.gz) — use this when the two DBs can't talk directly.
+#   ALLOW_COLD_START=yes  (unattended only) proceed even if neither is set and the prod store is empty.
 # Optional:
 #   PROD_ARTIFACTS_DEST  rsync target for artifacts/ (skip if it's a shared volume)
 #   SERVICE_URL          default http://localhost:8080
@@ -127,40 +132,104 @@ verify_sync_schedule
 
 # 3) Promote the LEARNT STATE into the production behaviour store, so production CONTINUES from the
 #    current learnt behaviour instead of starting cold — and the daily 04:00 pull then only ADDS the
-#    delta on top. All direct DB->DB (out-of-band; NOTHING here is committed to git). The target
-#    schema is created by the app's ensure_schema()/schema_pg.sql. Two parts:
-#      (a) the SMALL learnt tables — idempotent (INSERT ... ON CONFLICT DO NOTHING), safe on re-run
-#          and it never clobbers profiles production has since learned on its own;
-#      (b) the LARGE transaction cache + the sync WATERMARK — fast COPY, seeded ONLY when the prod
-#          cache is empty (so a re-run never duplicates it). The cache and bp_sync_state are moved
-#          TOGETHER so the watermark stays consistent with the history and the next pull continues
-#          cleanly (pulls only new rows, not a full re-fetch). The cache is what the model uses for
-#          velocity features and for retraining, so without it prod would be cold.
-: "${SRC_STORE_DSN:?set SRC_STORE_DSN (store holding the learnt profiles + transaction cache)}"
+#    delta on top. Everything is OUT-OF-BAND (NOTHING here is committed to git). The target schema is
+#    created by the app's ensure_schema()/schema_pg.sql. In BOTH transports the promotion is two parts:
+#      (a) the SMALL learnt tables (profiles + peer baselines) — idempotent (INSERT ... ON CONFLICT DO
+#          NOTHING), safe on re-run and it never clobbers profiles production has since learned itself;
+#      (b) the LARGE transaction cache + the sync WATERMARK — seeded ONLY when the prod cache is empty
+#          (so a re-run never duplicates ~1.3 GB), and TOGETHER so the watermark stays consistent with
+#          the history and the next pull continues cleanly (new rows only, not a full re-fetch). The
+#          cache is what the model uses for velocity features and retraining, so without it prod is cold.
+#
+#    TWO TRANSPORTS — pick whichever your network allows (deploy.sh auto-detects):
+#      • DIRECT DB->DB pipe — set SRC_STORE_DSN (reachable) + PROD_STORE_DSN. deploy.sh pipes it live.
+#      • STORE BUNDLE FILE — when the two DBs CANNOT talk directly (e.g. you build the bundle on your PC
+#        and the prod host cannot reach your store). Build it once with `./make_store_dump.sh`, scp the
+#        resulting store-bundle.tar.gz next to deploy.sh (or point STORE_BUNDLE at it), and deploy.sh
+#        restores from the file. If BOTH are available the bundle file wins (explicit beats live).
 : "${PROD_STORE_DSN:?set PROD_STORE_DSN (production behaviour store)}"
+STORE_BUNDLE="${STORE_BUNDLE:-$HERE/store-bundle.tar.gz}"
 
-log "Promoting learnt profiles + peer baselines -> production (idempotent; won't overwrite prod's own) ..."
-pg_dump "$SRC_STORE_DSN" --data-only --no-owner --inserts --on-conflict-do-nothing 2>/dev/null \
-  -t bp_user_behaviour_profile -t bp_peer_baseline \
-  | psql "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 >/dev/null \
-  || fail "learnt-profile promotion (pg_dump | psql) failed"
-log "Learnt profiles + peer baselines promoted."
+# helpers -------------------------------------------------------------------------------------------
+_prod_cache_count(){ psql "$PROD_STORE_DSN" -tAc 'SELECT count(*) FROM bp_transactions_cache' 2>/dev/null | tr -dc '0-9'; }
 
-# (b) Seed the raw transaction CACHE + sync watermark — ONLY when production's cache is empty, so the
-#     history and the watermark stay consistent and a re-run never duplicates ~1.3 GB. Fast COPY.
-PROD_CACHE_N="$(psql "$PROD_STORE_DSN" -tAc 'SELECT count(*) FROM bp_transactions_cache' 2>/dev/null || echo 0)"
-PROD_CACHE_N="$(printf '%s' "$PROD_CACHE_N" | tr -dc '0-9')"; PROD_CACHE_N="${PROD_CACHE_N:-0}"
-if [ "$PROD_CACHE_N" = "0" ]; then
-  log "Seeding production transaction cache + sync watermark via COPY (large — the current history) ..."
-  pg_dump "$SRC_STORE_DSN" --data-only --no-owner -t bp_transactions_cache -t bp_sync_state 2>/dev/null \
+promote_from_dsn(){                                    # transport 1: live DB -> DB
+  : "${SRC_STORE_DSN:?set SRC_STORE_DSN (the store holding the learnt profiles + cache)}"
+  log "Learnt-state transport: DIRECT DB->DB (SRC_STORE_DSN -> PROD_STORE_DSN)."
+  log "Promoting learnt profiles + peer baselines (idempotent; won't overwrite prod's own) ..."
+  pg_dump "$SRC_STORE_DSN" --data-only --no-owner --inserts --on-conflict-do-nothing 2>/dev/null \
+    -t bp_user_behaviour_profile -t bp_peer_baseline \
     | psql "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 >/dev/null \
-    || fail "cache + watermark seed (pg_dump | psql) failed"
-  SEEDED_N="$(psql "$PROD_STORE_DSN" -tAc 'SELECT count(*) FROM bp_transactions_cache' 2>/dev/null | tr -dc '0-9')"
-  log "Transaction cache seeded (${SEEDED_N:-?} rows) — production continues from the current history; the daily pull adds only the delta."
+    || fail "learnt-profile promotion (pg_dump | psql) failed"
+  log "Learnt profiles + peer baselines promoted."
+  local n; n="$(_prod_cache_count)"; n="${n:-0}"
+  if [ "$n" = "0" ]; then
+    log "Seeding transaction cache + sync watermark via COPY (large — the current history) ..."
+    psql "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 -qc 'TRUNCATE bp_sync_state' >/dev/null 2>&1 || true
+    pg_dump "$SRC_STORE_DSN" --data-only --no-owner -t bp_transactions_cache -t bp_sync_state 2>/dev/null \
+      | psql "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 >/dev/null \
+      || fail "cache + watermark seed (pg_dump | psql) failed"
+    log "Transaction cache seeded ($(_prod_cache_count) rows) — prod continues from the current history."
+  else
+    log "Production cache already has $n rows — leaving cache + watermark untouched (re-run safe)."
+  fi
+}
+
+promote_from_bundle(){                                 # transport 2: store-bundle.tar.gz (out-of-band)
+  command -v pg_restore >/dev/null 2>&1 || fail "pg_restore not found — needed to restore the store bundle"
+  log "Learnt-state transport: STORE BUNDLE ${STORE_BUNDLE} (out-of-band file)."
+  local work; work="$(mktemp -d)"
+  tar xzf "$STORE_BUNDLE" -C "$work" || { rm -rf "$work"; fail "could not extract ${STORE_BUNDLE}"; }
+  if [ -f "$work/store-learnt.sql" ]; then
+    log "Restoring learnt profiles + peer baselines from bundle (idempotent) ..."
+    psql "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 -q -f "$work/store-learnt.sql" >/dev/null \
+      || { rm -rf "$work"; fail "learnt-profile restore (psql) failed"; }
+    log "Learnt profiles + peer baselines restored."
+  else
+    log "WARNING: store-learnt.sql not in the bundle — skipping profiles."
+  fi
+  local n; n="$(_prod_cache_count)"; n="${n:-0}"
+  if [ "$n" = "0" ]; then
+    if [ -f "$work/store-cache.dump" ]; then
+      log "Restoring transaction cache + sync watermark from bundle (COPY) ..."
+      psql "$PROD_STORE_DSN" -v ON_ERROR_STOP=1 -qc 'TRUNCATE bp_sync_state' >/dev/null 2>&1 || true
+      pg_restore --no-owner --data-only -d "$PROD_STORE_DSN" "$work/store-cache.dump" >/dev/null 2>&1 \
+        || { rm -rf "$work"; fail "cache restore (pg_restore) failed"; }
+      log "Transaction cache restored ($(_prod_cache_count) rows) — prod continues from the current history."
+    else
+      log "WARNING: store-cache.dump not in the bundle — cache NOT seeded (prod would be cold)."
+    fi
+  else
+    log "Production cache already has $n rows — leaving cache + watermark untouched (re-run safe)."
+  fi
+  rm -rf "$work"
+}
+
+if [ -f "$STORE_BUNDLE" ]; then
+  promote_from_bundle
+elif [ -n "${SRC_STORE_DSN:-}" ]; then
+  promote_from_dsn
 else
-  log "Production cache already has ${PROD_CACHE_N} rows — leaving cache + watermark untouched (re-run safe). The daily pull keeps it current."
+  # Neither transport available. Don't hard-fail (prod store may already be seeded / a shared DB), but
+  # do NOT let production silently start with an EMPTY store — gate it like the other prerequisites.
+  n="$(_prod_cache_count)"; n="${n:-0}"
+  if [ "$n" != "0" ]; then
+    log "No SRC_STORE_DSN and no store bundle, but production already has ${n} cached rows — continuing."
+  else
+    log "No learnt-state transport: SRC_STORE_DSN is unset AND no store bundle at ${STORE_BUNDLE},"
+    log "and production's store is EMPTY. Production would start COLD (no history for velocity/retrain)."
+    log "Fix: build a bundle on a host that can reach your store — ./make_store_dump.sh — scp"
+    log "store-bundle.tar.gz next to deploy.sh, and re-run; OR set SRC_STORE_DSN for a direct DB->DB pipe."
+    if [ -t 0 ]; then
+      read -r -p "Continue with a COLD production store anyway? [y/N] " a
+      case "$a" in y|Y) log "Operator confirmed a cold start — continuing." ;;
+                   *) fail "stopped — provide a store bundle or SRC_STORE_DSN, then re-run." ;; esac
+    else
+      [ "${ALLOW_COLD_START:-no}" = "yes" ] || fail "no learnt-state transport and empty prod store. Provide a bundle / SRC_STORE_DSN, or pass ALLOW_COLD_START=yes to override."
+    fi
+  fi
 fi
-log "Learnt state promoted (production starts warm, not from zero)."
+log "Learnt state promotion done (production starts warm, not from zero)."
 
 # 3b) Unpack the MODEL BUNDLE if present. The trained model + registry are shipped OUT-OF-BAND
 #     (never committed to git — the model files contain customer-derived identifiers, beneficiary
