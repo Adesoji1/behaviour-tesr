@@ -318,7 +318,7 @@ depending on host ports for service-to-service traffic.
   accident; the app reaches the DB as `db:5432` on the internal network, never a shared host port.
 
 ```bash
-docker compose up -d --build                                # db + behaviour-profile + sync
+docker compose up -d --build                                # db + redis + behaviour-profile + sync
 docker compose --profile train run --rm trainer --promote   # train (GPU), promote, exit
 ```
 
@@ -495,14 +495,38 @@ loop above). (The former per-request `UPDATE bp_user_behaviour_profile` counter-
 ## Quick start (local)
 
 ```bash
-cp .env.example .env    # set STORE_PG_* (+ PROD_PG_* for ingestion); never commit .env
-docker compose up -d --build            # db + behaviour-profile + sync
-curl -s localhost:8080/health
-# score a transaction (Txn payload) — see ml/README.md for the full body
+cp .env.example .env    # never commit .env
+```
+**Set these two before the first start, or the stack will not boot** (both are fail-fast on purpose):
+- `STORE_PG_PASSWORD` — the behaviour-store password (compose refuses to start without it).
+- An API key for `/score` — either `BP_API_KEY=<any-secret>` **or** `BP_API_KEY_DISABLED=1` for local
+  dev (the API deliberately refuses to start if neither is set). In production `deploy.sh` generates one
+  for you; locally, set one of these.
+
+```bash
+docker compose up -d --build       # builds + starts ALL FOUR services (see table)
+curl -s localhost:8080/health      # -> {"status":"ok", ...}
+# score a transaction (Txn payload) — see ml/README.md for the full body / demo/ for a runnable example
+```
+
+**The running stack is four services — `docker compose up` starts them all; none is optional except
+`sync` (prod-only ingestion). Redis is required — it backs live velocity:**
+
+| service | container | what it is | needed to serve `/score`? |
+|---|---|---|---|
+| `db` | `behaviour-profile-db` | PostgreSQL behaviour store (learnt profiles + transaction cache) | **yes** |
+| `redis` | `adhere-redis` | live-velocity window (real-time burst features); **fail-safe** — if it's down `/score` still works on the batch cache | recommended (velocity degrades without it) |
+| `behaviour-profile` | `adhere-behaviour` | the API — `POST /score`, model in-process | **yes** |
+| `sync` | `adhere-behaviour-sync` | the scheduled production pull (the only prod reader) + webhook relay | prod only (idles in dev) |
+
+If you prefer to name them explicitly (identical result):
+```bash
+docker compose up -d --build db redis behaviour-profile sync
 ```
 
 Train / retrain / MLOps (triggers, drift, health, Slack), artifacts, and env vars are documented
-in **[`ml/README.md`](ml/README.md)**.
+in **[`ml/README.md`](ml/README.md)**. Production bring-up (learnt state + model, out-of-band) is in
+**[`DEPLOYMENT.md`](DEPLOYMENT.md)**.
 
 ## Start / stop the service (webhook-safe)
 
