@@ -267,25 +267,43 @@ runs the same check, so a misconfigured container **exits cleanly** instead of c
 Swagger error responses (401 with `{"detail": …}` + `WWW-Authenticate`, and 422) are documented as
 real JSON bodies with Example Values on `/docs`.
 
-**Two ways to set the single active key:**
+**Two ways to set the single active key. Pick ONE — copy-paste, they don't fail:**
 
-- **(a) Fixed key in `.env`** — set `BP_API_KEY` (generated with `openssl rand -hex 32`). `config.py`
-  reads it and the container gets it via `env_file: .env`. This value (hashed) is THE active key and
-  **overrides** the DB. Simplest for a single consumer.
-- **(b) Rotating key in the DB** — leave `BP_API_KEY` empty and manage keys **in the behaviour
-  service** with `manage_api_key.py`. Only the **SHA-256 hash** is stored (table `bp_api_key`); the
-  plaintext is shown **once**. Exactly **one key is active at a time** — rotating a new one
-  **invalidates the former immediately**:
+**(a) Fixed key in `.env`** (simplest for a single consumer). Generate a strong key and write it into
+`.env` (works whether or not `BP_API_KEY=` is already there):
 
 ```bash
-docker exec adhere-behaviour python manage_api_key.py rotate   # copy the key ONCE
-curl -X POST http://localhost:8080/reload                      # activate immediately
-curl -X POST http://localhost:8080/score -H 'X-Adhere-Key: <key>' -H 'Content-Type: application/json' -d @txn.json
+KEY=$(openssl rand -hex 32)
+grep -q '^BP_API_KEY=' .env && sed -i "s|^BP_API_KEY=.*|BP_API_KEY=$KEY|" .env || echo "BP_API_KEY=$KEY" >> .env
+echo "Your X-Adhere-Key: $KEY"      # store it — send it as  -H \"X-Adhere-Key: $KEY\"
+docker compose up -d --force-recreate behaviour-profile     # picks up the new key
 ```
 
-`docker exec adhere-behaviour python manage_api_key.py show` lists keys (metadata only). Without the
-`/reload`, a rotated DB key is still picked up automatically within `BP_API_KEY_CACHE_TTL` (~30s).
-`BP_API_KEY_DISABLED=1` turns auth off (internal/dev only).
+This value (hashed) is THE active key and **overrides** the DB. `python -c "import secrets;print(secrets.token_hex(32))"` works too if `openssl` isn't installed.
+
+**(b) Rotating key in the DB** (leave `BP_API_KEY` empty). Keys are managed by `manage_api_key.py`;
+only the **SHA-256 hash** is stored (`bp_api_key`), the plaintext is shown **once**, and exactly one
+key is active — rotating invalidates the former. **Generate it with the store up but BEFORE (or
+after) the API is running** — use `docker compose run` so there is no "needs a key to start" deadlock:
+
+```bash
+docker compose up -d db                                                   # the store must be up
+docker compose run --rm behaviour-profile python manage_api_key.py rotate --label "adhere $(date +%F)"
+docker compose up -d behaviour-profile                                    # now it boots (a key exists)
+# already running? rotate live instead, then reload:
+#   docker exec adhere-behaviour python manage_api_key.py rotate && curl -X POST localhost:8080/reload
+```
+
+Then call it:
+```bash
+curl -X POST http://localhost:8080/score -H "X-Adhere-Key: <the-key-shown-once>" \
+  -H 'Content-Type: application/json' -d @txn.json
+```
+
+`docker compose run --rm behaviour-profile python manage_api_key.py show` lists keys (metadata only).
+A rotated DB key is picked up automatically within `BP_API_KEY_CACHE_TTL` (~30s) even without `/reload`.
+`BP_API_KEY_DISABLED=1` turns auth off (internal/dev only). In **production, `deploy.sh` generates a
+key automatically** if none exists and prints it once — so a deploy never blocks on this.
 
 **Input validation** (returns **422** with a clear message): `amount` must be **> 0**; `currency`
 must be a **3-letter ISO-4217** code; `transaction_type` ∈ `{transfer, ussd, web, card}`;
@@ -499,9 +517,10 @@ cp .env.example .env    # never commit .env
 ```
 **Set these two before the first start, or the stack will not boot** (both are fail-fast on purpose):
 - `STORE_PG_PASSWORD` — the behaviour-store password (compose refuses to start without it).
-- An API key for `/score` — either `BP_API_KEY=<any-secret>` **or** `BP_API_KEY_DISABLED=1` for local
-  dev (the API deliberately refuses to start if neither is set). In production `deploy.sh` generates one
-  for you; locally, set one of these.
+- An API key for `/score` — the API deliberately refuses to start if none is set. Generate one:
+  `KEY=$(openssl rand -hex 32); grep -q '^BP_API_KEY=' .env && sed -i "s|^BP_API_KEY=.*|BP_API_KEY=$KEY|" .env || echo "BP_API_KEY=$KEY" >> .env` —
+  or set `BP_API_KEY_DISABLED=1` for local dev only. Full options (incl. the rotating DB key) in
+  **"Securing `/score` with an API key"** below. In production `deploy.sh` generates one automatically.
 
 ```bash
 docker compose up -d --build       # builds + starts ALL FOUR services (see table)
@@ -1004,7 +1023,35 @@ never appear in a response: `amt_log` (log transform), the raw `amt_z` value, `a
 | **Data-limited gaps** | Device, login, session, balance, merchant/category, and other features cannot currently be implemented because the required data is unavailable. |
 | **Analyst-loop** | The analyst feedback loop is now **implemented** (`POST /feedback` → `bp_decision_feedback` → retrain override + real live precision). The remaining dependency is operational: the analyst team supplying verdicts. |
 | **Geovelocity** | IP-to-latitude/longitude geovelocity detection is not yet implemented and remains future work. |
+| **Multi-currency (per-currency profiles)** | **Not yet implemented.** The model is currency-blind (amounts are aggregated across currencies) and no non-NGN customer is eligible, so USD/GBP/EUR transactions fall through to the cold-start population path. See "Not yet implemented — per-currency behavioural profiles" below. |
 | **Conclusion** | The remaining gaps are primarily caused by unavailable data (device/login/session/etc.), rather than missing implementation of capabilities that the current data supports. |
+
+### Not yet implemented — per-currency behavioural profiles (USD / GBP / EUR)
+
+**Today the model works well for the NGN population it is trained on, but it does NOT yet model
+non-NGN behaviour per currency.** Two reasons, both verified against the live model:
+
+1. **No non-NGN customer is eligible.** The cache is ~99.99% NGN; only ~13 customers have any USD/USDT
+   rows (and they look like test data), and **none** meet the §1 eligibility gate (≥50 clean txns /
+   ≥30 days). So every USD/GBP/EUR transaction is **cold-start** — judged against the *population*
+   baseline, not a personal one.
+2. **The model is currency-blind.** `FeatureBuilder` aggregates each customer's `amount` across *all*
+   currencies into one set of stats, and scoring compares the **raw amount number** (no FX / no
+   per-currency baseline). Because the population baseline is NGN-derived (median ≈ 5,900, p95 ≈
+   100,500), a USD amount is judged as if it were that raw number: e.g. cold-start USD `$5,000` →
+   *safe*, `$250,000` → *unsafe* — the model is reacting to the **number**, not understanding
+   "dollars". A customer who genuinely transacts in USD gets **no learned USD "normal."**
+
+**What it needs (planned, not built):**
+- **Per-currency grain** — profile per `(entity_key, currency)` so a customer's USD normal is separate
+  from their NGN normal (schema, build, and scoring changes; a design plan already exists).
+- **Currency normalization** applied identically on the build and scoring sides (`POUND→GBP`,
+  `EURO→EUR`, `USDT→USD`, trim/upper).
+- **Real non-NGN volume** so those `(customer, currency)` profiles clear the eligibility gate.
+
+Until then, treat any non-NGN `/score` result as a **cold-start, population-relative** decision, not a
+per-customer per-currency one. (The absolute protections — hard caps, cross-border, blacklist,
+velocity — still apply regardless of currency.)
 
 
 ## Demo
