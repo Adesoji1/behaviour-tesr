@@ -53,12 +53,29 @@ DETECTOR_LABELS = {"isoforest": "Isolation Forest", "autoencoder": "Autoencoder"
                    "gnn": "Graph-structure model"}
 DETECTOR_HIGH = float(config.__dict__.get("DETECTOR_HIGH", 0.85))
 
+
+# Amount-vs-historical-maximum, read straight from the features so the wording is mathematically
+# consistent: amount STRICTLY above the max = "exceeds"; amount EQUAL to the max = "at" (an equal
+# amount is never "exceeds"); below = "". `above_max` is the strict (amount > max) indicator and
+# `amt_over_max` is amount/max (== 1 at the max, within float tolerance). Single source of truth for
+# both the triggered-signals reasons and the narrative description.
+_MAX_REL_TOL = 1e-6
+def _amount_vs_max(f: dict) -> str:
+    if f.get("above_max", 0) >= 1:
+        return "exceeds"
+    if f.get("amt_over_max", 0) >= 1.0 - _MAX_REL_TOL:
+        return "at"
+    return ""
+
+
 # Behavioural signals: (machine code, analyst phrase, predicate on the feature vector).
 # These populate triggered_signals / detection_reason DYNAMICALLY, so the response always
 # explains WHY a transaction was flagged.
 _FEATURE_SIGNALS = [
     ("amount_above_historical_max", "amount exceeds the customer's historical maximum",
-     lambda f: f.get("above_max", 0) >= 1 or f.get("amt_over_max", 0) >= 1),
+     lambda f: _amount_vs_max(f) == "exceeds"),
+    ("amount_at_historical_max", "amount is at the customer's historical maximum",
+     lambda f: _amount_vs_max(f) == "at"),
     ("amount_far_above_usual", "amount far above the customer's usual",
      lambda f: f.get("amt_z", 0) >= 3 or f.get("amt_over_median", 0) >= 5),
     ("new_beneficiary", "first-time beneficiary",
@@ -103,6 +120,7 @@ _FEATURE_SIGNALS = [
 _COLD_START_REASON = {
     "amount_far_above_usual": "transaction amount is far above the population baseline",
     "amount_above_historical_max": "amount exceeds the population baseline maximum",
+    "amount_at_historical_max": "amount is at the population baseline maximum",
 }
 
 
@@ -192,12 +210,17 @@ class Tiering:
         amt_noun = ""      # lowercase fragment, for the SAFE "some variation was noted (…)" list
         amt_sentence = ""  # capitalised standalone sentence, for the review/unsafe narrative
         amt_x = feats.get("amt_over_median", 0)
-        above_max = (feats.get("above_max", 0) >= 1 or feats.get("amt_over_max", 0) >= 1) and not is_cold_start
+        # 'exceeds' (amount > max) vs 'at' (amount == max) vs '' — never say "exceeds" at the max.
+        # Suppressed for cold-start (no personal max; population wording handled elsewhere).
+        maxrel = "" if is_cold_start else _amount_vs_max(feats)
+        max_tail = {"exceeds": " and exceeds their historical maximum",
+                    "at": " and is at their historical maximum"}.get(maxrel, "")
         if amt_x >= 2:
-            tail = " and exceeds their historical maximum" if above_max else ""
-            amt_noun = f"the transaction amount is approximately {int(round(amt_x)):,}× {usual}{tail}"
-        elif above_max:
+            amt_noun = f"the transaction amount is approximately {int(round(amt_x)):,}× {usual}{max_tail}"
+        elif maxrel == "exceeds":
             amt_noun = "the transaction amount exceeds the customer's historical maximum"
+        elif maxrel == "at":
+            amt_noun = "the transaction amount is at the customer's historical maximum"
         if amt_noun:
             amt_sentence = amt_noun[0].upper() + amt_noun[1:] + "."
 
@@ -250,9 +273,18 @@ class Tiering:
             return "Safe. Consistent with the customer's behaviour."
 
         # --- REVIEW / UNSAFE: an investigation-summary narrative that an analyst can scan -----------
-        strength = (1 if amt_noun else 0) + len(ev) + len(dets)
+        # "multi-signal" ONLY when ≥2 distinct BEHAVIOURAL signals fired (amount + novelty/velocity/…);
+        # when the flag is driven by the ML detectors agreeing (0-1 behavioural signal), say
+        # "ensemble-detected" so the source of the conclusion is precise, not overstated.
+        behavioural = (1 if amt_noun else 0) + len(ev)
+        strength = behavioural + len(dets)
         if status == "unsafe":
-            lead = "Strong multi-signal behavioural anomaly — high risk; immediate review recommended."
+            if behavioural >= 2:
+                lead = "Strong multi-signal behavioural anomaly — high risk; immediate review recommended."
+            elif dets:
+                lead = "Strong ensemble-detected behavioural anomaly — high risk; immediate review recommended."
+            else:
+                lead = "Strong behavioural anomaly — high risk; immediate review recommended."
         else:  # review
             lead = ("Strong behavioural anomaly detected — review recommended."
                     if strength >= 3 else "Mild behavioural anomaly — monitor.")
