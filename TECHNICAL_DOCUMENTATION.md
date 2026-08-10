@@ -147,19 +147,34 @@ downtime.
 |---|---|---|---|
 | 1 | Clean baseline (min history) | Yes | Clean-only; ≥ 50 txns / ≥ 30 days (target 90 as the window grows). |
 | 2 | Minimum data (days/txns/…) | Partial | Days + transactions enforced; login/device/session data unavailable. |
-| 3 | Retrain frequency (daily) | Partial | Pull auto-scheduled (04:00); retrain-due check auto after each pull; retrain itself manual + gated by design. |
+| 3 | Retrain frequency (daily) | Partial | Daily pull (04:00) + daily retrain-due check + the §4 gate are **all automatic**; only the retrain *step* is a **human-gated** trigger (the automated daily cron/CronJob is written but kept disabled by choice, as a safety gate). One config flag from fully-daily. **To reach ✅ (suggested, not yet done):** enable the gated auto-retrain cron — still §4-gated, so it never trains on tiny changes. An ops flag, not new code. |
 | 4 | Retrain only on enough data (≥100 txns OR 30 days OR drift) | Yes | Exact OR condition in `retrain_trigger`. |
 | 5 | Sliding window (90–180 days) | Yes | `LOOKBACK_MONTHS`. |
 | 6 | Time decay | Yes | Applied **in the model** (half-life 90 days). |
 | 7 | Never learn confirmed fraud | Yes | Blocked/blacklisted excluded; analyst `fraud` verdicts also excluded. |
 | 8 | Stability (no single-event profile shift) | Yes | `/score` never mutates the profile; re-learning is the offline batch retrain. |
-| 9 | Drift detection | Partial | PSI amount-drift + live flag-rate; gradual vs sudden not separated. |
+| 9 | Drift detection | Partial | Drift **is** detected (PSI amount-distribution drift + live flag-rate + per-transaction novelty flags). The PDF's responses are covered: *gradual → adapt slowly* via the sliding window (§5) + time-decay (§6); *sudden → flag first, learn only after validation* via the stability rule (§8) + analyst verification (§11). **Missing: an explicit gradual-vs-sudden classifier. To reach ✅ (suggested, not yet done):** add one — PSI trend over rolling windows = gradual; a large single-window jump / change-point = sudden — with distinct alerts. |
 | 10 | Confidence threshold | Yes | A `confidence_score` is produced. |
 | 11 | Retrain after analyst verification | Yes | `POST /feedback` loop wired (training override + real precision); depends on analysts supplying verdicts. |
 | 12 | Versioning & rollback | Yes | Registry + promote/rollback. |
 | 14 | Retraining triggers | Partial | New-txns / drift / scheduled / performance / **analyst-feedback** done; new-segment / new-pattern / feature-change not yet. |
 | 15 | Prevent model/profile poisoning | Yes | Clean-only data, eligibility gate, acceptance gate, analyst-verdict correction. |
 | 16 | Profile components (18 listed) | Partial | ~8 implemented (amount, times, day patterns, velocity, beneficiary, channel, partial location/IP); device/network/session/balance/salary/merchant unavailable. |
+
+**On the two "Partial" rows that are choices, not gaps:**
+
+- **§3 (daily retraining)** is Partial *only* because the retrain execution is a human-gated trigger.
+  The daily schedule, the retrain-due check and the §4 gate are all built and automatic. **The path to
+  ✅ is a single ops flag** — enable the (already-written) gated daily cron; it stays §4-gated so it
+  never retrains on tiny changes. We keep it manual for now as a deliberate safety gate.
+- **§9 (drift detection)** is Partial *only* because there is no explicit gradual-vs-sudden **classifier**.
+  Drift is detected (PSI + novelty), and both PDF responses are already implemented via other rules
+  (gradual → §5 window + §6 decay; sudden → §8 stability + §11 verification). **The path to ✅** is to
+  add a small classifier (PSI trend = gradual; single-window jump / change-point = sudden) with its own
+  alerts. *(Suggested here; not implemented.)*
+
+The remaining Partials (§2, §16) are **data-limited** — device / login / session / balance / merchant
+signals are not available in the source feed, so they cannot be implemented until that data exists.
 
 ---
 
