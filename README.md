@@ -423,6 +423,34 @@ logs *"NOT promoting"*). So the service can never be pushed a worse model. `/rel
 is what makes a newly-promoted model take effect; without a promotion, the service keeps serving the
 current one. To revert: `python -c "from ml import registry; registry.rollback()"` then `/reload`.
 
+#### Is drift detected when data is pulled, or only at `/score`?
+
+**Both — and, importantly, drift is detected on the pulled DATA, not just at inference.** After **every**
+sync pull, the `sync` service runs two independent checks ([`sync_manager.py`](sync_manager.py), the
+`_check_retrain_due` + `_check_live_drift` calls):
+
+1. **Data-side drift → "retrain DUE"** ([`ml/retrain_trigger.py`](ml/retrain_trigger.py), the §4 trigger).
+   It measures the freshly-pulled **cache** against the active model's training **watermark** and fires
+   if **any** of: new transactions since training ≥ `BF_RETRAIN_MIN_NEW` (100); **or** days elapsed ≥
+   `BF_RETRAIN_MAX_DAYS` (30); **or** **amount-distribution drift (PSI)** ≥ `BF_DRIFT_PSI` (0.25) — a
+   real distribution-shift signal comparing the new data against the training reference. If it trips,
+   the sync Slacks *"retrain DUE — &lt;reasons&gt;"* (de-duplicated via `bp_alert_state`). **So a pull
+   can trigger a drift/retrain signal on its own.**
+2. **Live-side drift → `monitor.check_live()`** (§9/§11). Reads the `/score` decisions in `bp_decision`
+   (the flagged-rate band) **plus** the real precision/recall from the analyst-feedback loop once labels
+   exist (see below).
+
+Two clarifications:
+- **`/score` itself computes no drift or performance** — it only *writes* each decision to `bp_decision`
+  (the old per-request counter was removed). The live check reads those decisions **later**, inside the
+  `sync` service — never on the hot request path.
+- **The model does not auto-retrain.** These signals **alert humans**; retraining is **manual + gated**
+  (`ml.retrain_trigger --run` retrains and promotes *only if it beats the active model*). The automation
+  (cron / k8s CronJob) is written but intentionally disabled.
+
+So drift monitoring is **two-sided**: the *pulled data* (PSI / new-data → retrain-due) **and** the
+*accumulated `/score` decisions* (flag-rate + precision). The next two sections detail each side.
+
 #### Does `/score` traffic trigger a "model is degrading → retrain" Slack alert?
 
 **Yes — implemented, with one honest caveat.** As `/score` runs, every decision is written to
