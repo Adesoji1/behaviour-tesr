@@ -243,9 +243,38 @@ class CustomerDetails(BaseModel):
 
 class AdditionalInfo(BaseModel):
     ip_address: str = Field(..., description="IP address during the transaction", example="192.168.1.1")
-    location: str = Field(..., description='Location string or lat/lon, e.g. "Lagos, Nigeria" or '
-                          '"lat=-30.66,lon=-65.77"', example="Lagos, Nigeria")
+    location: str = Field(..., description='Human-readable location, e.g. "Lagos, Nigeria". '
+                          "Free text — NOT parsed for coordinates; send lat/long in the fields below.",
+                          example="Lagos, Nigeria")
+    # OPTIONAL first-party coordinates of the CUSTOMER's actual location for this transaction. When
+    # supplied they are the highest-priority geo source for the (best-effort, non-scoring) geo-velocity
+    # enrichment. Omitting them keeps the existing contract intact — existing clients are unaffected.
+    # See the "Geo-velocity data requirement" disclaimer in the /score endpoint description.
+    latitude: Optional[float] = Field(None, example=6.5244,
+                                      description="OPTIONAL. The CUSTOMER's actual latitude (WGS84, "
+                                      "-90..90) for this transaction — not an agent/terminal location. "
+                                      "Enables the optional geo-velocity signal; a missing/invalid/out-of-"
+                                      "range value is simply IGNORED (geo unavailable) and never fails the "
+                                      "request or affects the fraud decision. See the /score disclaimer.")
+    longitude: Optional[float] = Field(None, example=3.3792,
+                                       description="OPTIONAL. The CUSTOMER's actual longitude (WGS84, "
+                                       "-180..180) for this transaction — not an agent/terminal location. "
+                                       "Invalid values are ignored, never rejected. See latitude.")
     transaction_description: Optional[str] = Field(None, example="Payment for order #789")
+
+    @field_validator("latitude", "longitude", mode="before")
+    @classmethod
+    def _optional_coord(cls, v):
+        """Optional geo coordinate: coerce to float; anything missing / empty / non-numeric becomes None
+        so a bad coordinate simply makes geo UNAVAILABLE and NEVER fails the request (3.md §15 fail-safe).
+        Range (-90..90 / -180..180) is validated downstream by the geo resolver, so an out-of-range value
+        is dropped there rather than returned as a 422 here — location is never enforced at the API."""
+        if v is None or v == "":
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
 
 
 class Txn(BaseModel):
@@ -479,7 +508,17 @@ def score(t: Txn, background: BackgroundTasks, _key: None = Depends(require_api_
     The behavioural anti-fraud MODEL is the only decision engine (no rule/AML scoring lives
     here — AML is a separate service). The decision is persisted to bp_decision for audit and
     delivered by webhook; the customer's statistical profile is updated event-driven off the hot
-    path (see _score_with_model)."""
+    path (see _score_with_model).
+
+    **Geo-velocity data requirement (disclaimer):** Geo-velocity is an OPTIONAL behavioural signal and
+    is only available when the client provides a valid representation of the customer's ACTUAL location
+    for the transaction. Where supported, provide accurate customer `additional_info.latitude` /
+    `additional_info.longitude` in the documented format. If location data is missing, malformed,
+    invalid, or represents an agent/terminal location rather than the customer's actual location,
+    geo-velocity may not be calculated and the system should not be expected to produce a geographic
+    anomaly flag. **Missing or invalid location data will not cause the transaction to fail and will not
+    affect the existing behavioural fraud decision.** Providing location is never required and is never
+    enforced."""
     return _score_with_model(t, background)
 
 

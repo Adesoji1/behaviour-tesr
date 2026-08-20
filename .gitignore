@@ -50,6 +50,14 @@ behavioral_analysis_data
 # customer-derived. The code + requirements are committed; the outputs are not.
 artifacts/
 1.md
+2.md
+3.md
+phase2.md
+phase3.md
+# ...but the first-party geo LOCATION REGISTRY is reference data (public geo facts, no PII) that the
+# service loads at runtime — it MUST ship. Re-include it despite the data/ rule above.
+!ml/data/
+!ml/data/ng_locations.json
 
 .venv-ml/
 

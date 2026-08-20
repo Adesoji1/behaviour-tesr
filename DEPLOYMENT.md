@@ -44,6 +44,9 @@ gate, order, verify). For a plain local dev run, `docker compose up -d` is fine;
 - **The model + store are shipped OUT-OF-BAND, never in git** (they hold customer data; the store dump
   also exceeds GitHub's 100 MB file limit). Build them with `./prepare_release.sh` (see §2) — the repo
   carries only code + `schema_pg.sql`.
+- **Geo location registry — no deploy step.** The first-party dataset `ml/data/ng_locations.json`
+  (required by the optional geo/shadow signal) is **tracked in git and baked into the serving image**
+  (`Dockerfile COPY . .`). It ships with the code, **not** via `deploy.sh`. Nothing to copy or configure.
 - **Make the shell scripts executable** (a fresh checkout may not carry the bit):
   ```bash
   chmod +x deploy.sh watchdog.sh make_store_dump.sh backup_store.sh install_pg_client.sh prepare_release.sh

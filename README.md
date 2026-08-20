@@ -310,6 +310,53 @@ must be a **3-letter ISO-4217** code; `transaction_type` ∈ `{transfer, ussd, w
 `account_type` ∈ `{individual, corporate}`; `customer_email` must be a valid email; required fields
 enforced.
 
+### Optional geo-velocity — data requirement (disclaimer)
+
+> **Geo-velocity data requirement:** Geo-velocity is an **optional** behavioural signal and is only
+> available when the client provides a valid representation of the customer's **actual** location for
+> the transaction. Where supported, provide accurate customer **latitude** and **longitude**
+> (`additional_info.latitude` / `additional_info.longitude`, WGS84) in the documented format. If
+> location data is missing, malformed, invalid, or represents an **agent/terminal** location rather
+> than the customer's actual location, geo-velocity may not be calculated and the system should not be
+> expected to produce a geographic anomaly flag. **Missing or invalid location data will not cause the
+> transaction to fail and will not affect the existing behavioural fraud decision.**
+
+The client is responsible for supplying accurate customer-location data if they want geo-velocity to be
+available; it is **never required and never enforced** — omitting it is a normal, fully-supported case.
+Geo is currently an internal **shadow** signal (telemetry only) and does **not** influence the `/score`
+decision or the 27-feature model.
+
+**`/score` behaviour for IP and coordinate inputs** (every case returns **200** and the fraud decision
+is **unchanged** — geo/IP never fail the request and geo never changes the decision):
+
+| Input | Result | Effect on the decision |
+|---|---|---|
+| `ip_address` — valid **or** malformed **or** private | **200**, scored normally | none beyond the existing `ip_new` novelty feature (a bad IP makes it neutral). Geo does not use the IP (no local IP→coord resolver). |
+| `latitude`/`longitude` — **valid** | **200**, scored normally | none — used only for the **shadow** geo telemetry; the decision is identical with or without them. |
+| `latitude`/`longitude` — **missing / malformed / out-of-range** | **200**, scored normally | none — the coordinate is **ignored** (geo simply unavailable). It is **never** rejected with a 4xx and never affects the decision. |
+
+The behavioural fraud decision comes **only** from the 27-feature model (amount, velocity, novelty such
+as `new_location`/`ip_new`, timing, graph). A transaction can be `review`/`unsafe` purely from those
+signals regardless of any geo/IP input.
+
+**Sending coordinates (client-side):** `latitude`/`longitude` are two **optional** keys inside the
+existing `additional_info` object — the rest of the payload is unchanged:
+```json
+"additional_info": { "ip_address": "...", "location": "Lagos, Nigeria",
+                     "latitude": 6.5244, "longitude": 3.3792 }
+```
+If omitted, geo falls back to the `location` string (via the local registry) or is unavailable; if
+present, they take priority. Either way the decision is unchanged.
+
+**Deployment note — the geo location registry ships in the code image (no extra step).** Location
+resolution uses a first-party, deterministic dataset, **`ml/data/ng_locations.json`** (36 Nigerian
+states + major cities; public geo facts, no PII), loaded once at startup by `ml/geo_registry.py`. It is
+a **required runtime file** and is **baked into the serving image** by the Dockerfile (`COPY . .`; it is
+tracked in git and not in `.dockerignore`). It is **not** shipped by `deploy.sh` (which only moves the
+model + store out-of-band) — like any source file, it travels with the code/image. If the file were
+missing the registry would simply be empty (location resolution disabled) — geo would degrade to
+unavailable and `/score` would still work; it is never a hard dependency.
+
 ---
 
 ## Production topology & containers (no clashes)

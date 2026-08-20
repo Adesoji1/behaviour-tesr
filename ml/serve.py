@@ -17,7 +17,7 @@ from functools import lru_cache
 import numpy as np
 import pandas as pd
 
-from . import codes, config, inference_log, live_velocity, registry
+from . import codes, config, geo, geo_state, inference_log, live_velocity, registry
 from .codes import Tiering
 from .models.autoencoder import AutoencoderDetector
 from .models.ensemble import Ensemble
@@ -36,6 +36,24 @@ class _Model:
         blob = joblib.load(d / "featurebuilder.joblib")
         self.fb = features.FeatureBuilder(blob["feature_version"])
         self.fb.baselines, self.fb.global_ = blob["baselines"], blob["global"]
+        # Schema-drift guard: score on exactly the features THIS model was trained on. Older models
+        # (and today's) do not persist a "features" list -> assume they match the running FEATURES
+        # (unchanged behaviour). If the model was trained on a strict PREFIX of the running features
+        # (i.e. new code appended trailing features the model never saw), GRACEFULLY score on the
+        # model's set so a rollback stays safe; any other divergence is a real mismatch -> fail fast
+        # rather than silently mis-score.
+        self.model_features = list(blob.get("features") or [])
+        run_features = list(features.FEATURES)
+        if not self.model_features or self.model_features == run_features:
+            self.feat_cols = run_features
+        elif run_features[:len(self.model_features)] == self.model_features:
+            log.warning("schema guard: model %s trained on %d features, code has %d — scoring on the "
+                        "model's set (ignoring trailing %s)", version, len(self.model_features),
+                        len(run_features), run_features[len(self.model_features):])
+            self.feat_cols = self.model_features
+        else:
+            raise RuntimeError(f"feature-schema mismatch for model {version}: model={self.model_features} "
+                               f"vs code={run_features} — refusing to score (retrain or rollback needed)")
         try:
             self.gfeat = joblib.load(d / "graph_features.joblib")   # per-customer g_* for inference
         except Exception:
@@ -121,6 +139,9 @@ def _row_from_payload(p: dict) -> dict:
         "origin_country": cust.get("country") or p.get("origin_country"),
         "destination_country": p.get("destination_country"),
         "destination_account_no": dest.get("account_number"),
+        # OPTIONAL first-party coordinates (best-effort geo enrichment only; never required)
+        "latitude": add.get("latitude"),
+        "longitude": add.get("longitude"),
     }
 
 
@@ -143,7 +164,7 @@ def score_payload(payload: dict) -> dict:
         X = m.fb.transform(df, graph_feats).iloc[[-1]].reset_index(drop=True)  # scored txn is last
     else:
         X = m.fb.transform(pd.DataFrame([row]), graph_feats)
-    feat_cols = features.FEATURES
+    feat_cols = m.feat_cols                       # the features THIS model was trained on (schema guard)
     scores = {"isoforest": m.iso.score(X[feat_cols].to_numpy())}
     if m.ae.available and m.ae.model is not None:
         scores["autoencoder"] = m.ae.score(X[feat_cols].to_numpy())
@@ -185,11 +206,53 @@ def score_payload(payload: dict) -> dict:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "inference_ms": round((time.perf_counter() - t0) * 1000, 2),
     }
-    inference_log.log_inference(response)   # compliance history: customer, decision, time taken
+    # Geo-velocity SHADOW enrichment (Phase 1): compute + log ONLY. It does NOT touch X, the risk, the
+    # decision, or the response — scoring above is unchanged. Best-effort, never raises.
+    geo_tel = _geo_shadow(row, is_cold)
+    inference_log.log_inference(response, geo=geo_tel)   # compliance history (+ internal geo telemetry)
     # Record THIS transaction into the live window AFTER scoring, so the NEXT /score for this
     # customer sees it (real-time velocity). Fail-safe no-op when Redis is off/unreachable.
     live_velocity.record(row["customer_key"], row["transaction_id"], row["amount"], row["date_created"])
     return response
+
+
+def _geo_shadow(row: dict, is_cold: bool) -> dict | None:
+    """Phase-1 SHADOW geo enrichment: resolve the transaction's coordinates via the first-party
+    waterfall, compute geo-velocity (km/h) vs the customer's previous point, and store the current
+    point for next time. Returns internal telemetry for the compliance log ONLY — it never affects the
+    feature vector, the score, or the decision, and never raises into /score."""
+    if not config.GEO_ENABLED:
+        return None
+    try:
+        det = geo.resolve_detail(row.get("latitude"), row.get("longitude"),
+                                 row.get("customer_ip_address"), row.get("customer_location"))
+        tel = {"geo_source": det["source"], "geo_eligible": (not is_cold),
+               "geo_enrichment_success": det["source"] != "unavailable",
+               "geo_granularity": det["granularity"], "geo_matched": det["matched"],
+               "geo_precision_m": det["precision_m"],
+               "plus_code_present": det["plus_code_present"], "plus_code_decoded": det["plus_code_decoded"],
+               "loc_present": det["loc_present"], "loc_resolved": det["loc_resolved"],
+               "ip_present": det["ip_present"], "ip_public": det["ip_public"],
+               "ip_resolved": det["ip_resolved"], "unresolved_reason": det["reason"],
+               "geo_velocity_available": 0, "geo_velocity_kmh": None}
+        # geo-velocity is meaningful only for ELIGIBLE (established) customers with a resolvable point.
+        if is_cold or det["source"] == "unavailable":
+            return tel
+        ck = str(row["customer_key"])
+        ts = row.get("date_created")
+        cur_ep = float(ts.timestamp()) if ts is not None and ts == ts else None
+        prev = geo_state.previous(ck)
+        if prev is not None and cur_ep is not None:
+            elapsed_h = (cur_ep - prev["epoch"]) / 3600.0
+            kmh = geo.geo_velocity_kmh((prev["lat"], prev["lon"]), (det["lat"], det["lon"]), elapsed_h)
+            tel["geo_velocity_available"] = 1
+            tel["geo_velocity_kmh"] = round(kmh, 3)
+        geo_state.record(ck, det["lat"], det["lon"], ts)   # store current AFTER reading prev
+        return tel
+    except Exception as e:                          # enrichment must never break scoring
+        log.debug("geo shadow failed (non-fatal): %s", e)
+        return {"geo_source": "error", "geo_enrichment_success": False,
+                "geo_velocity_available": 0, "geo_velocity_kmh": None}
 
 
 def _mask(payload: dict) -> str:

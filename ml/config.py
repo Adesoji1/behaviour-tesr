@@ -83,6 +83,22 @@ def normalize_transaction_type(raw) -> str:
 REDIS_URL = os.getenv("BP_REDIS_URL", "").strip()
 VELOCITY_RETAIN_HOURS = float(os.getenv("BP_VELOCITY_RETAIN_HOURS", "48"))   # TTL of the live window
 
+# --- geo-velocity enrichment (SHADOW / Phase 1) — OPTIONAL, best-effort, FIRST-PARTY only ---------
+# When enabled, /score computes a geo-velocity observation (impossible-travel km/h) from FIRST-PARTY
+# geo evidence ONLY and LOGS it as internal telemetry — it does NOT (yet) affect the score or the
+# feature vector (that is a later, retrain-gated phase). No external/paid geolocation (no MaxMind /
+# GeoLite2 / geo APIs). Fail-safe: if no coordinates, no usable internal IP resolver, and no approved
+# location registry are available, geo is simply "unavailable" and scoring continues unchanged.
+GEO_ENABLED = os.getenv("BF_GEO_ENABLED", "1") == "1"           # master switch for the shadow enrichment
+# P2 hook: dotted path "module:function" of an INTERNAL, first-party IP->(lat,lon) resolver. Empty =
+# no IP resolution (there is no such mapping in this repo — supply your own to activate P2).
+GEO_IP_RESOLVER = os.getenv("BF_GEO_IP_RESOLVER", "").strip()
+# P3 hook: dotted path "module:function" of an INTERNAL, approved location-string->(lat,lon) registry
+# lookup. Empty = no registry (none exists yet). Never string-parse the free-text location otherwise.
+GEO_LOCATION_REGISTRY = os.getenv("BF_GEO_LOCATION_REGISTRY", "").strip()
+GEO_PREV_RETAIN_HOURS = float(os.getenv("BF_GEO_PREV_RETAIN_HOURS", "168"))   # TTL of the last-geo point
+GEO_MAX_KMH = float(os.getenv("BF_GEO_MAX_KMH", "0") or 0)      # optional clip on reported km/h (0 = off)
+
 
 def attach_file_log(default: str = "/app/logs/ml.log") -> None:
     """Also write ML-job logs to a rotated plain-text file (bind-mounted to ./logs), so a

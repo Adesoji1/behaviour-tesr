@@ -187,8 +187,21 @@ signals are not available in the source feed, so they cannot be implemented unti
   population — it is reacting to the number, not "understanding dollars." Proper support needs a
   per-`(customer, currency)` profile grain, currency normalization on both build and scoring sides, and
   real non-NGN volume so those profiles become eligible. **A design plan exists; it is not implemented.**
-- **Geovelocity (impossible-travel) — not implemented.** IP-to-geo distance/time ("logged in from Lagos
-  and London 5 minutes apart") is not computed. Location/IP novelty *is* used; geovelocity is future work.
+- **Geo-velocity (impossible-travel) — OPTIONAL, shadow only; not an ML feature.** A best-effort
+  geo-velocity signal is computed *only when the client supplies the customer's actual coordinates*
+  (`additional_info.latitude`/`longitude`); it is recorded as internal telemetry and **does not**
+  influence the `/score` decision or the 27-feature model. Investigation established that the existing
+  `customer_location` is an **agent/terminal** location (not the customer's position) and the IP is a
+  shared ISP/gateway address, so geo-velocity is **not viable from current data** without client-supplied
+  customer GPS — the blocker is data capture, not the pipeline.
+
+  > **Geo-velocity data requirement (client disclaimer):** Geo-velocity is an **optional** behavioural
+  > signal and is only available when the client provides a valid representation of the customer's
+  > **actual** location for the transaction (accurate `additional_info.latitude`/`longitude`, WGS84). If
+  > location data is missing, malformed, invalid, or represents an agent/terminal location rather than the
+  > customer's actual location, geo-velocity may not be calculated and no geographic anomaly flag should
+  > be expected. **Missing or invalid location data will not cause the transaction to fail and will not
+  > affect the behavioural fraud decision.** Providing location is never required and never enforced.
 - **Cold-start coverage.** The model knows **5,528 of 32,895 customers (~17%)**; the remaining ~83% are
   **cold-start** and are judged against the **population** baseline rather than a personal one. This is a
   *coverage* limitation (not enough per-customer history yet), not a logic defect — coverage grows as the

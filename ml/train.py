@@ -83,7 +83,9 @@ def run(sample=None, limit=None, promote=False) -> dict:
     feat_cols = features.FEATURES
     import joblib
     joblib.dump({"baselines": fb.baselines, "global": fb.global_,
-                 "feature_version": fb.feature_version}, mdir / "featurebuilder.joblib")
+                 "feature_version": fb.feature_version,
+                 "features": list(features.FEATURES)},   # schema guard: what this model was trained on
+                mdir / "featurebuilder.joblib")
     # persist per-customer graph features so inference computes the SAME g_* values it trained on
     # (otherwise a single-row payload has g_*=0 — a train/serve skew that inflates scores).
     if not gfeat.empty:

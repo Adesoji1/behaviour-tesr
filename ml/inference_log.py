@@ -32,9 +32,13 @@ def _append(record: dict) -> None:
         log.warning("audit log write failed: %s", e)
 
 
-def log_inference(response: dict) -> None:
-    """One line per scored transaction: who, what decision, how risky, which model, how long."""
-    _append({
+def log_inference(response: dict, geo: dict | None = None) -> None:
+    """One line per scored transaction: who, what decision, how risky, which model, how long.
+
+    `geo` (optional) is INTERNAL geo-velocity shadow telemetry (geo_source, availability, km/h). It is
+    recorded here for coverage measurement ONLY — it is never part of the /score response and never
+    contains raw IPs or internal source details."""
+    rec = {
         "event": "inference",
         "logged_at": datetime.now(timezone.utc).isoformat(),
         "timestamp": response.get("timestamp"),
@@ -48,7 +52,10 @@ def log_inference(response: dict) -> None:
         "is_cold_start": (response.get("result") or {}).get("is_cold_start"),
         "model_version": response.get("model_version"),
         "inference_ms": response.get("inference_ms"),
-    })
+    }
+    if geo is not None:
+        rec["geo"] = geo
+    _append(rec)
 
 
 def log_delivery(transaction_id, target: str, ok: bool, detail: str = "") -> None:
