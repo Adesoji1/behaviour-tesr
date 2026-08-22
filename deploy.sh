@@ -298,7 +298,7 @@ if [ ! -f "$MODEL_BUNDLE" ] && [ -n "${MODEL_BUNDLE_URL:-}" ]; then
   _fetch "$MODEL_BUNDLE_URL" "$MODEL_BUNDLE" || fail "could not fetch model bundle from ${MODEL_BUNDLE_URL}"
 fi
 if [ -f "$MODEL_BUNDLE" ]; then
-  log "Unpacking model bundle ${MODEL_BUNDLE} -> ./artifacts ..."
+  log "Unpacking model bundle ${MODEL_BUNDLE} -> repo root (populates ./artifacts/models + ./artifacts/registry) ..."
   tar xzf "$MODEL_BUNDLE" -C "$HERE" || fail "could not extract model bundle ${MODEL_BUNDLE}"
   log "Model bundle unpacked (active: $(grep -o '"active"[^,]*' artifacts/registry/index.json 2>/dev/null | head -1))."
 elif [ -d artifacts/models ] && [ -n "$(ls -A artifacts/models 2>/dev/null)" ]; then
