@@ -30,9 +30,11 @@ COPY . .
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import urllib.request;urllib.request.urlopen('http://localhost:8080/health')" || exit 1
 
-# Worker count is env-driven (BP_WORKERS, default 2) so throughput can be scaled to the
-# deployment's peak concurrency without a rebuild. Shell form so the var is expanded.
-# PREFLIGHT: validate REQUIRED config (an API key must be configured — env or DB) using the SAME
-# validator the app runs at startup. On failure it exits non-zero, so `&&` stops uvicorn from ever
-# binding and the container exits CLEANLY with a clear error — instead of workers crash-looping.
-CMD ["sh", "-c", "python -c 'import service; service._require_api_key_configured()' && uvicorn service:app --host 0.0.0.0 --port 8080 --workers ${BP_WORKERS:-2}"]
+# Start via render-entrypoint.sh — a single start path that works EVERYWHERE:
+#   * Render (model NOT in image): fetches MODEL_BUNDLE_URL into ./artifacts on boot.
+#   * Local compose (model volume-mounted): sees ./artifacts/registry/index.json already
+#     present and SKIPS the fetch.
+# It then runs the SAME API-key preflight (exits cleanly if unconfigured, no crash-loop),
+# and binds uvicorn to $PORT (Render injects it; falls back to 8080 locally) with
+# BP_WORKERS workers. The `sync` service overrides this command, so it is unaffected.
+CMD ["sh", "render-entrypoint.sh"]
