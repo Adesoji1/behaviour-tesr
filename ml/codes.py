@@ -95,7 +95,7 @@ _FEATURE_SIGNALS = [
     ("velocity_burst", "burst of transactions in a short window (1-3 min)",
      # velocity counts are log1p-scaled: log1p(3)=1.39 (~3 txns/3min), log1p(2)=1.10 (~2 txns/1min)
      lambda f: f.get("vel_3m", 0) >= 1.39 or f.get("vel_1m", 0) >= 1.10),
-    ("recent_activity", "recent transaction activity elevated the risk (below the burst threshold)",
+    ("recent_activity", "recent transaction activity contributed to the elevated risk score, although the burst threshold was not reached",
      # sub-burst velocity: some recent activity moved the detectors but did not reach 'velocity_burst'.
      lambda f: (f.get("vel_3m", 0) < 1.39 and f.get("vel_1m", 0) < 1.10)
                and any(f.get(c, 0) > 0 for c in ("vel_1m", "vel_2m", "vel_3m", "vel_10m", "vel_15m", "vel_1h"))),
@@ -244,8 +244,8 @@ class Tiering:
             ev.append((f"a burst of approximately {n} transactions within a few minutes",
                        f"follows a burst of approximately {n} transactions within minutes"))
         elif any(feats.get(c, 0) > 0 for c in ("vel_1m", "vel_2m", "vel_3m", "vel_10m", "vel_15m", "vel_1h")):
-            ev.append(("recent transaction activity that raised the risk (below the burst threshold)",
-                       "follows recent account activity that raised the risk (below the burst threshold)"))
+            ev.append(("recent transaction activity below the burst threshold",
+                       "follows recent account activity that contributed to the elevated risk score, although the burst threshold was not reached"))
         if feats.get("amt_1h_ratio", 0) >= 2.0:
             ev.append(("a spike in their spending over the last hour", "spikes the last hour's spending"))
         if feats.get("g_fanout", 0) >= 0.9 and feats.get("g_distinct_benef", 0) >= 1.6:
