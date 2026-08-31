@@ -82,6 +82,9 @@ def normalize_transaction_type(raw) -> str:
 # exactly as before. Fail-safe: if Redis is unreachable, scoring silently continues cache-only.
 REDIS_URL = os.getenv("BP_REDIS_URL", "").strip()
 VELOCITY_RETAIN_HOURS = float(os.getenv("BP_VELOCITY_RETAIN_HOURS", "48"))   # TTL of the live window
+# Master switch for the live Redis window (default ON). When off, /score + /score/audit score
+# cache-only (Redis is still the transport when on; this just gates whether we read/record it).
+LIVE_VELOCITY = os.getenv("BP_LIVE_VELOCITY", "1") == "1"
 
 # --- geo-velocity enrichment (SHADOW / Phase 1) — OPTIONAL, best-effort, FIRST-PARTY only ---------
 # When enabled, /score computes a geo-velocity observation (impossible-travel km/h) from FIRST-PARTY

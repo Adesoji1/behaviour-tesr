@@ -80,6 +80,14 @@ def test_endpoints_registered_documented_and_secured():
     assert schema["components"]["securitySchemes"]["APIKeyHeader"]["name"] == "X-Adhere-Key"
 
 
+def test_live_velocity_flag_is_in_ml_config():
+    # serve.py gates the Redis live window on config.LIVE_VELOCITY (ml.config, NOT root config) —
+    # it must exist there or /score raises AttributeError.
+    from ml import config as mlcfg
+    assert hasattr(mlcfg, "LIVE_VELOCITY"), "ml.config.LIVE_VELOCITY missing — serve.py references it"
+    assert isinstance(mlcfg.LIVE_VELOCITY, bool)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

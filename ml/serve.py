@@ -154,8 +154,10 @@ def score_payload(payload: dict, include_audit: bool = False) -> dict:
     graph_feats = (pd.DataFrame([{"customer_key": row["customer_key"], **gf}]) if gf else None)
     hist = _recent_history(row["customer_key"], row["date_created"])
     # Enrich with the LIVE window (Redis): transactions since the last sync — real-time bursts across
-    # separate /score calls. Fail-safe: empty when Redis is off/unreachable (velocity uses cache only).
-    live = live_velocity.recent(row["customer_key"], row["date_created"])
+    # separate /score calls. Gated by BP_LIVE_VELOCITY (default ON); when off we score cache-only.
+    # Fail-safe: also empty when Redis is off/unreachable (velocity uses cache only).
+    live = (live_velocity.recent(row["customer_key"], row["date_created"])
+            if config.LIVE_VELOCITY else pd.DataFrame())
     if not live.empty:
         hist = live if hist.empty else pd.concat([hist, live], ignore_index=True)
         hist = hist.drop_duplicates(subset=["transaction_id"], keep="last")  # a synced txn may be in both
@@ -216,8 +218,10 @@ def score_payload(payload: dict, include_audit: bool = False) -> dict:
     geo_tel = _geo_shadow(row, is_cold)
     inference_log.log_inference(response, geo=geo_tel)   # compliance history (+ internal geo telemetry)
     # Record THIS transaction into the live window AFTER scoring, so the NEXT /score for this
-    # customer sees it (real-time velocity). Fail-safe no-op when Redis is off/unreachable.
-    live_velocity.record(row["customer_key"], row["transaction_id"], row["amount"], row["date_created"])
+    # customer sees it (real-time velocity). Gated by BP_LIVE_VELOCITY (default ON); fail-safe
+    # no-op when Redis is off/unreachable.
+    if config.LIVE_VELOCITY:
+        live_velocity.record(row["customer_key"], row["transaction_id"], row["amount"], row["date_created"])
     return response
 
 
