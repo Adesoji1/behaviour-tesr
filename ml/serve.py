@@ -145,7 +145,7 @@ def _row_from_payload(p: dict) -> dict:
     }
 
 
-def score_payload(payload: dict) -> dict:
+def score_payload(payload: dict, include_audit: bool = False) -> dict:
     t0 = time.perf_counter()
     m = _active()
     row = _row_from_payload(payload)
@@ -206,6 +206,11 @@ def score_payload(payload: dict) -> dict:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "inference_ms": round((time.perf_counter() - t0) * 1000, 2),
     }
+    # Decision-audit block (endpoint 3 only): the learned-vs-observed side-by-side, built from the
+    # SAME feats/decision computed above so it can never disagree with /score. Off by default, so
+    # /score's response is byte-identical.
+    if include_audit:
+        response["audit"] = _build_audit(payload, row, m, feats, hist, is_cold, det_scores, risk, conf, decision)
     # Geo-velocity SHADOW enrichment (Phase 1): compute + log ONLY. It does NOT touch X, the risk, the
     # decision, or the response — scoring above is unchanged. Best-effort, never raises.
     geo_tel = _geo_shadow(row, is_cold)
@@ -259,3 +264,213 @@ def _mask(payload: dict) -> str:
     cust = payload.get("customer_details", {}) or {}
     idv = cust.get("identifier") or cust.get("bvn") or ""
     return f"id:***{str(idv)[-4:]}" if idv else "id:unknown"
+
+
+# =============================================================================
+# ANALYST-FACING READ/COMPARE HELPERS (endpoints: learnt behaviour, re-learning
+# diff, decision audit). These READ the SAME learned baselines the model scores
+# with — no scoring change, no side effects (except the decision audit, which is
+# a real scoring pass and mirrors /score, Redis included). All never raise.
+# =============================================================================
+_DOW = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def _top_hist(hist, labels=None, top=3):
+    """The top-`top` buckets of a normalised histogram (busiest hours 0-23 or days)."""
+    if not hist:
+        return []
+    order = sorted(range(len(hist)), key=lambda i: hist[i], reverse=True)
+    return [(labels[i] if labels else i) for i in order[:top] if hist[i] > 0]
+
+
+def _baseline_view(b: dict) -> dict:
+    """Human-readable view of ONE learned baseline (m.fb.baselines[key])."""
+    return {
+        "amount": {"median": round(float(b.get("amt_median", 0)), 2),
+                   "mean": round(float(b.get("amt_mean", 0)), 2),
+                   "p95": round(float(b.get("amt_p95", 0)), 2),
+                   "max": round(float(b.get("amt_max", 0)), 2),
+                   "std": round(float(b.get("amt_std", 0)), 2)},
+        "usual_hours_of_day": _top_hist(b.get("hour_hist")),
+        "usual_days_of_week": _top_hist(b.get("dow_hist"), _DOW),
+        "known_locations": sorted(str(x) for x in b.get("locs", set()))[:20],
+        "known_beneficiaries_count": len(b.get("benefs", set())),
+        "known_transaction_types": sorted(str(x) for x in b.get("types", set())),
+        "known_ip_subnets_count": len(b.get("ips", set())),
+    }
+
+
+def learned_behaviour(identifier: str) -> dict:
+    """Endpoint 1 core: the behaviour the ACTIVE model learned for this customer,
+    or a cold-start notice when there is no personal profile yet."""
+    m = _active()
+    key = str(identifier)
+    b = m.fb.baselines.get(key)
+    if b is None:
+        return {"identifier": key, "model_version": m.version, "eligibility": "cold_start",
+                "is_cold_start": True, "baseline_type": "population",
+                "note": ("No personal behavioural profile yet (cold-start). This customer is judged "
+                         "against the POPULATION baseline until they accrue enough clean history."),
+                "learned": None}
+    return {"identifier": key, "model_version": m.version, "eligibility": "eligible",
+            "is_cold_start": False, "baseline_type": "personal",
+            "note": "This customer HAS a personal learned behavioural profile.",
+            "learned": _baseline_view(b)}
+
+
+@lru_cache(maxsize=4)
+def _baselines_for_version(version: str) -> dict:
+    """Load ONLY the baselines dict of a given model version (cheap — no detectors/torch)."""
+    import joblib
+    blob = joblib.load(registry.model_dir(version) / "featurebuilder.joblib")
+    return blob.get("baselines", {})
+
+
+def _diff_baselines(prev: dict, cur: dict) -> dict:
+    """What changed between two learned baselines: amounts, usual time, and the sets that were
+    ADDED or dropped (invalidated/decayed out)."""
+    def amt(b):
+        return {"median": round(float(b.get("amt_median", 0)), 2), "mean": round(float(b.get("amt_mean", 0)), 2),
+                "p95": round(float(b.get("amt_p95", 0)), 2), "max": round(float(b.get("amt_max", 0)), 2)}
+    p_loc, c_loc = {str(x) for x in prev.get("locs", set())}, {str(x) for x in cur.get("locs", set())}
+    p_ben, c_ben = {str(x) for x in prev.get("benefs", set())}, {str(x) for x in cur.get("benefs", set())}
+    p_typ, c_typ = {str(x) for x in prev.get("types", set())}, {str(x) for x in cur.get("types", set())}
+    return {
+        "amount": {"previous": amt(prev), "current": amt(cur),
+                   "median_shift": round(float(cur.get("amt_median", 0)) - float(prev.get("amt_median", 0)), 2)},
+        "usual_hours_of_day": {"previous": _top_hist(prev.get("hour_hist")),
+                               "current": _top_hist(cur.get("hour_hist"))},
+        "usual_days_of_week": {"previous": _top_hist(prev.get("dow_hist"), _DOW),
+                               "current": _top_hist(cur.get("dow_hist"), _DOW)},
+        "locations": {"added": sorted(c_loc - p_loc)[:20],
+                      "removed_invalidated": sorted(p_loc - c_loc)[:20],
+                      "still_known": sorted(c_loc & p_loc)[:20]},
+        "beneficiaries": {"added": len(c_ben - p_ben), "removed_invalidated": len(p_ben - c_ben)},
+        "transaction_types": {"added": sorted(c_typ - p_typ), "removed_invalidated": sorted(p_typ - c_typ)},
+        "decay": {"half_life_days": config.DECAY_HALF_LIFE_DAYS,
+                  "note": ("Learning is recency-weighted (half-life %g days): stale locations/beneficiaries "
+                           "decay out of the learned set and the amount stats track recent behaviour — so a "
+                           "'removed_invalidated' entry is old behaviour the new model no longer treats as normal."
+                           % config.DECAY_HALF_LIFE_DAYS)},
+    }
+
+
+def _model_built_at(version: str | None) -> str | None:
+    """The build timestamp encoded in a model version (bf-ensemble-YYYY.MM.DD-HHMMSS)."""
+    if not version:
+        return None
+    import re
+    mm = re.search(r"(\d{4})\.(\d{2})\.(\d{2})-(\d{2})(\d{2})(\d{2})", version)
+    if not mm:
+        return None
+    y, mo, d, h, mi, s = mm.groups()
+    return f"{y}-{mo}-{d}T{h}:{mi}:{s}"
+
+
+def behaviour_change(identifier: str) -> dict:
+    """Endpoint 2 core: how the model's learned behaviour for this customer changed between the
+    PREVIOUS and the CURRENT active model (i.e. after re-learning). Works from the registry, so it
+    is available wherever the model is (no store required)."""
+    m = _active()
+    key = str(identifier)
+    prev_v = registry._load().get("previous_active")
+    cur_b = m.fb.baselines.get(key)
+    out = {"identifier": key,
+           "current_model": m.version, "current_model_built": _model_built_at(m.version),
+           "previous_model": prev_v, "previous_model_built": _model_built_at(prev_v)}
+    if not prev_v:
+        out.update({"changed": None,
+                    "note": "Only one model version exists — no previous model to compare against yet."})
+        return out
+    prev_b = _baselines_for_version(prev_v).get(key)
+    if prev_b is None and cur_b is None:
+        out.update({"changed": None,
+                    "note": "Cold-start in BOTH models — no personal profile has been learned yet."})
+    elif prev_b is None and cur_b is not None:
+        out.update({"transition": "newly_learned", "current": _baseline_view(cur_b),
+                    "note": "Cold-start in the previous model; the current model has now learned a personal profile."})
+    elif prev_b is not None and cur_b is None:
+        out.update({"transition": "invalidated_to_coldstart", "previous": _baseline_view(prev_b),
+                    "note": "Had a personal profile before; the current model reverted this customer to cold-start "
+                            "(prior behaviour aged/decayed out and did not meet eligibility)."})
+    else:
+        out.update({"transition": "relearned", "changed": _diff_baselines(prev_b, cur_b),
+                    "note": "Behaviour was re-learned between the two models — see the per-dimension changes."})
+    return out
+
+
+def _build_audit(payload, row, m, feats, hist, is_cold, det_scores, risk, conf, decision) -> dict:
+    """Endpoint 3 core: the learned-vs-observed side-by-side (JSON form of demo/decision_audit.py),
+    proving the model COMPARED rather than guessed. Built from the SAME computation /score used, and
+    laid out to mirror that tool's STEP 1..5 sanity audit."""
+    key = str(row["customer_key"])
+    b = m.fb.baselines.get(key)
+    add = payload.get("additional_info", {}) or {}
+    dest = (payload.get("destination_account", {}) or {}).get("account_number")
+    ptype = config.normalize_transaction_type(payload.get("transaction_type"))
+
+    # STEP 1 — what the model learned (historical baseline): amount stats + the known sets.
+    if is_cold or b is None:
+        learned = {"has_personal_profile": False, "baseline_type": "population",
+                   "note": "Cold-start — judged against the population baseline (no personal history yet)."}
+    else:
+        learned = {
+            "has_personal_profile": True, "baseline_type": "personal",
+            "amount": {"median": round(float(b.get("amt_median", 0)), 2),
+                       "mean": round(float(b.get("amt_mean", 0)), 2),
+                       "p95": round(float(b.get("amt_p95", 0)), 2),
+                       "max": round(float(b.get("amt_max", 0)), 2),
+                       "std": round(float(b.get("amt_std", 0)), 2)},
+            "known": {"beneficiaries": len(b.get("benefs", set())), "locations": len(b.get("locs", set())),
+                      "ip_subnets": len(b.get("ips", set())),
+                      "transaction_types": sorted(str(x) for x in b.get("types", set()))},
+            "usual_hours_of_day": _top_hist(b.get("hour_hist")),
+            "usual_days_of_week": _top_hist(b.get("dow_hist"), _DOW),
+            "known_locations_sample": sorted(str(x) for x in b.get("locs", set()))[:20],
+        }
+
+    # STEP 3 — historical vs real-time (the model comparing, not guessing).
+    comparison = {
+        "amount": {"x_baseline_median": round(feats.get("amt_over_median", 0), 2),
+                   "amt_z": round(feats.get("amt_z", 0), 3),
+                   "above_historical_max": bool(feats.get("above_max", 0) >= 1)},
+        "velocity": {"vel_1m": round(feats.get("vel_1m", 0), 3), "vel_3m": round(feats.get("vel_3m", 0), 3),
+                     "vel_1h": round(feats.get("vel_1h", 0), 3), "vel_24h": round(feats.get("vel_24h", 0), 3),
+                     "amt_1h_ratio": round(feats.get("amt_1h_ratio", 0), 3),
+                     "recent_txns_in_window": 0 if hist is None or hist.empty else int(len(hist))},
+    }
+    if not is_cold and b is not None:
+        comparison["beneficiary"] = {"in_learned_set": bool(feats.get("beneficiary_new", 1) < 1),
+                                     "verdict": "new" if feats.get("beneficiary_new", 0) >= 1 else "known"}
+        comparison["location"] = {"in_learned_set": not bool(feats.get("location_new", 0)),
+                                  "verdict": "new" if feats.get("location_new", 0) else "known",
+                                  "learned_sample": sorted(str(x) for x in b.get("locs", set()))[:5]}
+        comparison["ip_subnet"] = {"in_learned_subnets": not bool(feats.get("ip_new", 0)),
+                                   "verdict": "new" if feats.get("ip_new", 0) else "known"}
+        comparison["transaction_type"] = {"in_learned_types": not bool(feats.get("type_rare", 0)),
+                                          "verdict": "unusual" if feats.get("type_rare", 0) else "known"}
+
+    return {
+        # STEP 1
+        "what_the_model_learned": learned,
+        # STEP 2 — the real-time transaction
+        "the_real_time_transaction": {"amount": payload.get("amount"), "currency": payload.get("currency"),
+                                      "transaction_type": ptype, "beneficiary": dest,
+                                      "location": add.get("location"), "ip_address": add.get("ip_address"),
+                                      "timestamp": payload.get("timestamp")},
+        # STEP 3
+        "historical_vs_real_time": comparison,
+        # STEP 4 — detectors, blend, thresholds, decision
+        "detectors_blend_decision": {"detector_scores": det_scores,
+                                     "blend_mode": getattr(config, "BLEND_MODE", "escalate"),
+                                     "risk_score": round(risk, 4), "confidence": round(conf, 4),
+                                     "thresholds": {"review": round(m.tiering.cuts.get("review", 0), 4),
+                                                    "unsafe": round(m.tiering.cuts.get("unsafe", 0), 4)},
+                                     "decision": {"status": decision["status"],
+                                                  "activity_code": decision["activity_code"],
+                                                  "zone_label": decision["zone_label"]}},
+        # STEP 5
+        "why": decision["description"],
+        "live_velocity": "enabled : mirrors /score",
+        "note": "Side-by-side proof the model compared learned vs observed — it is not guessing.",
+    }

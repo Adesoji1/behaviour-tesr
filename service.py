@@ -30,7 +30,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Security
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Path, Request, Security
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import FileResponse
 from fastapi.security import APIKeyHeader
@@ -741,6 +741,131 @@ def get_profile(entity_key: str):
 @app.post("/retrain/{entity_key}")
 def force_retrain(entity_key: str):
     return retrain.retrain_customer(entity_key)
+
+
+# =============================================================================
+# ANALYST INSIGHT ENDPOINTS (API-key protected, like /score).
+#   1. GET  /learned              — what the model LEARNED for a customer (or cold-start)
+#   2. GET  /behaviour-change/{id}— how that learning CHANGED after re-learning (+ decay)
+#   3. POST /score/audit          — score + learned-vs-observed proof (no webhook; Redis on)
+# =============================================================================
+@app.get("/learned", tags=["analyst insights"],
+         summary="Learnt behaviour for a customer (eligible or cold-start)")
+def learned_behaviour(identifier: str | None = None, name: str | None = None, bvn: str | None = None,
+                      _key: None = Depends(require_api_key)):
+    """Show the behaviour the ACTIVE model learned for a customer: usual amount range, usual
+    hours/days, and the known locations, beneficiaries, transaction types and IP subnets.
+
+    Filter by ONE of: **`identifier`** (the key the model is keyed on — direct, works wherever the
+    model is loaded), **`bvn`**, or **`name`**. `bvn`/`name` are resolved to the model identifier via
+    the transaction cache (which carries identifier + bvn + customer_name together); they need a
+    populated cache, so on a store-less instance (e.g. Render) use `identifier`. Cold-start customers
+    are returned with `is_cold_start: true` and judged against the population baseline. `name`/`bvn`
+    may match several customers. Requires the `X-Adhere-Key` header.
+    """
+    from ml import serve as ml_serve
+    if identifier:
+        return ml_serve.learned_behaviour(identifier)
+    if not name and not bvn:
+        raise HTTPException(400, "provide ?identifier=<model key> or ?bvn=<bvn> or ?name=<customer name>")
+    # Resolve BVN/name -> the model's identifier via the transaction cache (the profile table uses a
+    # different key). BVN is an exact match; name is a case-insensitive contains.
+    where, param = ("bvn = %s", bvn) if bvn else ("customer_name ILIKE %s", f"%{name}%")
+    try:
+        conn = db.connect()
+        cur = db.dict_cursor(conn)
+        cur.execute(f"SELECT DISTINCT identifier, customer_name, bvn FROM bp_transactions_cache "
+                    f"WHERE {where} AND identifier IS NOT NULL ORDER BY customer_name LIMIT 25", (param,))
+        rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        audit.log.warning("/learned name/bvn lookup failed: %s", e)
+        rows = []
+    if not rows:
+        return {"query": {"name": name, "bvn": bvn}, "match_count": 0, "matches": [],
+                "note": "No match in the transaction cache (it is empty on a store-less instance such "
+                        "as Render, so name/BVN search is unavailable there — use ?identifier=)."}
+    out = []
+    for r in rows:
+        lb = ml_serve.learned_behaviour(str(r["identifier"]))
+        lb["customer_name"], lb["bvn"] = r["customer_name"], r["bvn"]
+        out.append(lb)
+    return {"query": {"name": name, "bvn": bvn}, "match_count": len(out), "matches": out}
+
+
+@app.get("/behaviour-change/{identifier}", tags=["analyst insights"],
+         summary="How a customer's learnt behaviour changed after re-learning")
+def behaviour_change(
+        identifier: str = Path(..., description="The customer's model key — the BVN / identifier the "
+                                                "model is keyed on (e.g. 10073149658). Same value you "
+                                                "pass to /learned?identifier=.",
+                               examples=["10073149658"]),
+        _key: None = Depends(require_api_key)):
+    """After a re-learn (model retrain), show what changed for this customer between the PREVIOUS
+    and CURRENT model: amount range, usual hours/days, and which locations / beneficiaries / types
+    were **added** or **removed_invalidated** (old behaviour that decayed out and is no longer
+    treated as normal). Includes a decay note (half-life) so you can see the recency weighting at
+    work. When the profile store is populated, also returns `store_decay_evidence` (the plain vs
+    recency-weighted average per currency — their gap is the decay in action). Requires `X-Adhere-Key`.
+    """
+    from ml import serve as ml_serve
+    result = ml_serve.behaviour_change(identifier)
+    # Augment with the statistical profile's decay evidence from the store, when present. The model
+    # key (identifier) maps to the profile's entity_key via the transaction cache, so bridge first.
+    try:
+        conn = db.connect()
+        cur = db.dict_cursor(conn)
+        cur.execute("SELECT entity_key FROM bp_transactions_cache WHERE identifier=%s "
+                    "AND entity_key IS NOT NULL LIMIT 1", (str(identifier),))
+        row = cur.fetchone()
+        if row:
+            cur.execute("SELECT currency, avg_amount, decayed_avg_amount, profile_version, "
+                        "drift_status, last_retrained_at FROM bp_user_behaviour_profile "
+                        "WHERE entity_key=%s ORDER BY total_tx_count DESC", (row["entity_key"],))
+            prows = cur.fetchall()
+            if prows:
+                result["store_decay_evidence"] = {
+                    "source": "statistical-profile layer — SEPARATE from the ML model above. Its dates "
+                              "are its own (not the model's; the model build dates are current_model_built "
+                              "/ previous_model_built), and it is keyed by entity_key, which differs from "
+                              "the model identifier.",
+                    "entity_key": row["entity_key"],
+                    "per_currency": [
+                        {"currency": r["currency"], "plain_avg": float(r["avg_amount"] or 0),
+                         "recency_weighted_avg": float(r["decayed_avg_amount"] or 0),
+                         "decay_gap": round(float(r["avg_amount"] or 0) - float(r["decayed_avg_amount"] or 0), 2),
+                         "profile_version": r["profile_version"], "drift_status": r["drift_status"],
+                         "statistical_profile_last_retrained_at":
+                             r["last_retrained_at"].isoformat() if r["last_retrained_at"] else None}
+                        for r in prows]}
+        conn.close()
+    except Exception as e:
+        audit.log.warning("/behaviour-change store augmentation failed (non-fatal): %s", e)
+    return result
+
+
+@app.post("/score/audit", tags=["analyst insights"],
+          summary="Score a transaction AND show the learned-vs-observed proof (no webhook)")
+def score_audit(t: Txn, _key: None = Depends(require_api_key)):
+    """Same decision engine and same live-velocity (Redis) window as **/score**, so the verdict is
+    identical — but the response also carries an **`audit`** block: what the model learned for this
+    customer, the observed transaction, the point-by-point comparison (amount vs baseline, new/known
+    beneficiary·location·IP·type, velocity), the detector scores + thresholds, the decision and the
+    plain-language reason. This is the API form of `demo/decision_audit.py` — proof the model
+    compared, not guessed. Unlike /score it does **not** persist a decision row and does **not** fire
+    a webhook. Requires the `X-Adhere-Key` header.
+    """
+    from ml import serve as ml_serve
+    payload = t.model_dump(exclude_none=True)
+    result = ml_serve.score_payload(payload, include_audit=True)
+    ident = (t.customer_details.identifier if t.customer_details else None) \
+        or (t.origin_account.account_number if t.origin_account else None) \
+        or t.transaction_id
+    result["entity_key"] = str(ident)
+    _cold = bool(result.get("result", {}).get("is_cold_start"))
+    result["baseline_info"] = {"baseline_type": "population" if _cold else "personal",
+                               "is_cold_start": _cold}
+    return result
 
 
 @app.get("/sync/status")
